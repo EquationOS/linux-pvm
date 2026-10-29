@@ -371,6 +371,18 @@ config AS_HAS_OPTION_ARCH
 source "arch/riscv/Kconfig.socs"
 source "arch/riscv/Kconfig.errata"
 
+config PVM_GUEST
+	bool "PVM guest support"
+	depends on 64BIT
+	default n
+	help
+	  This option enables the kernel to run as a PVM guest under the PVM
+	  hypervisor, where the kernel itself executes in U-mode and
+	  privileged operations trap into the host.  Host detection is
+	  device-tree based, so a kernel built with this option still boots
+	  natively when no PVM host is present.  See
+	  Documentation/arch/riscv/pvm.rst for details.
+
 menu "Platform type"
 
 config NONPORTABLE

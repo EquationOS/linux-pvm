@@ -28,6 +28,7 @@
 #include <asm/cpufeature.h>
 #include <asm/early_ioremap.h>
 #include <asm/pgtable.h>
+#include <asm/pvm_para.h>
 #include <asm/setup.h>
 #include <asm/set_memory.h>
 #include <asm/sections.h>
@@ -303,6 +304,7 @@ void __init setup_arch(char **cmdline_p)
 #else
 	unflatten_device_tree();
 #endif
+	pvm_early_setup();
 	misc_mem_init();
 
 	init_resources();

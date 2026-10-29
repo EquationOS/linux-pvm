@@ -47,6 +47,7 @@ extra-y += vmlinux.lds
 
 obj-y	+= head.o
 obj-y	+= soc.o
+obj-$(CONFIG_PVM_GUEST)	+= pvm.o
 obj-$(CONFIG_RISCV_ALTERNATIVE) += alternative.o
 obj-y	+= cpu.o
 obj-y	+= cpufeature.o
