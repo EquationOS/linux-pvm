@@ -37,4 +37,14 @@ config KVM
 
 	  If unsure, say N.
 
+config RISCV_PVM_HOST
+	bool "Experimental U-mode PVM host backend"
+	depends on KVM=y && 64BIT && FPU
+	help
+	  Select a software PVM backend instead of the H-extension backend.
+	  Runs a single-hart Sv39 guest kernel and its processes in U-mode
+	  under the S-mode Linux host. Uses /dev/kvm, owned shadow tables,
+	  a supervisor trampoline and SBI console/timer services.
+	  This experimental backend does not require the H extension.
+
 endif # VIRTUALIZATION

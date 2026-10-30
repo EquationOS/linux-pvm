@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Stage-B guest DT: CPU/memory/chosen/pvm marker ONLY. No physical
+ * devices: console is SBI (hvc0), reset is SBI SRST. All addresses
+ * fixed at build time; the VMM places blobs to match. */
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "riscv-virtio";
+	model = "pvm-riscv64-kvm-guest";
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <10000000>;
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imafdcsu";
+			mmu-type = "riscv,sv39";
+			interrupt-controller {
+				compatible = "riscv,cpu-intc";
+				#interrupt-cells = <1>;
+				interrupt-controller;
+			};
+		};
+	};
+
+	memory@80200000 {
+		device_type = "memory";
+		reg = <0x0 0x80200000 0x0 0x07e00000>;
+	};
+
+	chosen {
+		bootargs = "console=hvc0 earlycon=sbi pvm=strict rdinit=/init";
+		stdout-path = "sbi";
+		linux,initrd-start = <0x0 0x85000000>;
+		linux,initrd-end = <0x0 0x85400000>; /* 4MB window, zero-padded */
+	};
+
+	pvm {
+		compatible = "pvm,csr-guest";
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+};

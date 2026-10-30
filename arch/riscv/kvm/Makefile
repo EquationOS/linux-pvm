@@ -9,6 +9,9 @@ include $(srctree)/virt/kvm/Makefile.kvm
 
 obj-$(CONFIG_KVM) += kvm.o
 
+ifeq ($(CONFIG_RISCV_PVM_HOST),y)
+kvm-y += pvm/main.o pvm/mmu.o pvm/emulate.o pvm/switch.o
+else
 kvm-y += main.o
 kvm-y += vm.o
 kvm-y += vmid.o
@@ -33,3 +36,5 @@ kvm-y += aia.o
 kvm-y += aia_device.o
 kvm-y += aia_aplic.o
 kvm-y += aia_imsic.o
+
+endif

@@ -101,7 +101,11 @@ struct kvm_vmid {
 	unsigned long vmid;
 };
 
+struct riscv_pvm_vm;
+struct riscv_pvm_vcpu;
+
 struct kvm_arch {
+	struct riscv_pvm_vm *pvm;
 	/* G-stage vmid */
 	struct kvm_vmid vmid;
 
@@ -189,6 +193,7 @@ struct kvm_vcpu_smstateen_csr {
 };
 
 struct kvm_vcpu_arch {
+	struct riscv_pvm_vcpu *pvm;
 	/* VCPU ran at least once */
 	bool ran_atleast_once;
 
