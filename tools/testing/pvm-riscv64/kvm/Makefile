@@ -11,7 +11,7 @@ PAYLOAD_LDS := -Ttext=0x80200000
 W := $(PVM_WORKDIR)
 .SECONDARY:
 
-all: vmm vmm-linux vmm-neg payload.bin payload-c.bin payload-loop.bin payload-d.bin payload-mmu.bin payload-pvforge.bin getpid-window fp-signal-test
+all: vmm vmm-linux vmm-neg payload.bin payload-c.bin payload-loop.bin payload-d.bin payload-mmu.bin payload-pvforge.bin getpid-window fp-signal-test fast-loop-test fast-loop-parent
 
 vmm: vmm.c
 	$(CROSS)gcc $(CFLAGS) -o $@ $<
@@ -27,6 +27,12 @@ getpid-window: getpid-window.c
 
 fp-signal-test: fp-signal-test.c
 	$(CROSS)gcc -static -O2 -Wall -o $@ $<
+
+fast-loop-test: fast-loop-test.c
+	$(CROSS)gcc -static -O2 -Wall -o $@ $<
+
+fast-loop-parent: fast-loop-parent.c
+	$(CROSS)gcc -static -O2 -Wall -Wextra -o $@ $<
 
 # Common rule: assemble no-PIC, link to ELF at 0x80200000, objcopy .text
 %.elf: %.S
@@ -52,4 +58,4 @@ verify-payloads: payload.elf payload-c.elf payload-loop.elf payload-d.elf payloa
 	done
 
 clean:
-	rm -f vmm vmm-linux vmm-neg *.o *.bin *.elf getpid-window fp-signal-test
+	rm -f vmm vmm-linux vmm-neg *.o *.bin *.elf getpid-window fp-signal-test fast-loop-test fast-loop-parent fast-loop-parent

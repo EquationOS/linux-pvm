@@ -37,7 +37,7 @@ struct riscv_pvm_vcpu {
 	void *pv_frame_kva[2];
 	size_t pv_frame_len[2];
 	bool pv_context_valid;
-	bool supervisor, registered, sbi_pending, halted, pv_mode;
+	bool supervisor, registered, sbi_pending, halted, pv_mode, pv_fast;
 
 	u64 exits, faults, user_entries, timer_irqs, schedules, switches;
 	/* D2 classification counters (host-private, reset by
@@ -46,12 +46,16 @@ struct riscv_pvm_vcpu {
 	u64 n_satp_write, n_fill, n_inj_fault, n_inj_irq, n_host_irq;
 	u64 n_vmm_exit, n_wfi, n_inj_ill;
 	u64 n_pv_return, n_pv_reject, n_pv_entry;
+	u64 n_fast_in, n_fast_out, n_fast_irq, n_fast_fallback;
+	u64 n_phys_traps, n_root_writes, n_sfences_asm;
 	/* window bookkeeping: bases for EVERY exported counter */
 	u64 win_active;
 	u64 w_user_ecall, w_sbi, w_hypercall, w_csr, w_sret, w_sfence;
 	u64 w_satp_write, w_fill, w_inj_fault, w_inj_irq, w_host_irq;
 	u64 w_vmm_exit, w_wfi, w_inj_ill, w_exits;
 	u64 w_pv_entry, w_pv_return, w_pv_reject;
+	u64 w_phys_traps, w_root_writes, w_sfences_asm;
+	u64 w_fast_in, w_fast_out, w_fast_irq, w_fast_fallback;
 	u32 pv_diag, pv_irq_diag, pv_flow_diag;
 };
 int pvm_mmu_init(struct riscv_pvm_vcpu *v);
@@ -65,6 +69,7 @@ unsigned long pvm_translate(struct riscv_pvm_vcpu *v, unsigned long va,
 int pvm_page_fault(struct riscv_pvm_vcpu *v, unsigned long cause,
 		   unsigned long va);
 int pvm_emulate(struct riscv_pvm_vcpu *v);
+bool pvm_prepare_fast_cache(struct riscv_pvm_vcpu *v);
 void pvm_inject(struct riscv_pvm_vcpu *v, unsigned long cause,
 		unsigned long val);
 #endif
