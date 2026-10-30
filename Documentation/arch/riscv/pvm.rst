@@ -1,8 +1,8 @@
 .. SPDX-License-Identifier: GPL-2.0
 
-==========================
-PVM guest support on RV64
-==========================
+===================
+PVM support on RV64
+===================
 
 PVM (Pagetable-based Virtual Machine) is a software-only hypervisor design
 where the guest kernel runs in unprivileged mode (CPL3 on x86_64, U-mode on
@@ -34,12 +34,22 @@ The RV64 branch has two deliberately separate event protocols:
   Its handlers and live PV operation hooks remain incomplete. The M0
   integer protocol fixture does not constitute a Linux boot test.
 
-There is still no RV64 Linux/KVM PVM host vendor module or production
-switcher. The experimental M-mode monitor is a functional bootstrap
-fixture, not that missing host implementation, and does not implement the
-USyscall hardware fast path. Ordinary S-mode boots without a PVM DT marker
-remain native. See ``tools/testing/pvm-riscv64/README.md`` for commands,
-assertions, memory ownership, and explicit limitations.
+An experimental S-mode Linux/KVM host now implements the CSR trap path
+under ``arch/riscv/kvm/pvm``. Select ``CONFIG_RISCV_PVM_HOST=y`` with
+built-in KVM and FPU; otherwise the existing H-extension backend remains
+selected. It uses ordinary VM/vCPU fds and KVM_RUN, host-owned Sv39
+shadow roots and a supervisor-only trampoline, with both guest kernel
+and user physically in U-mode. It does not require H or USyscall. Host
+interrupts, scheduling, signals, SBI console/timer and guest /init are
+covered by the bounded acceptance in ``tools/testing/pvm-riscv64/kvm``.
+
+The host is limited to one guest vCPU, fixed 126 MiB backing, Sv39 and
+a small VMM/ONE_REG subset. It does not implement the full generic
+QEMU/KVM RISC-V ABI, guest SMP, RVV, migration or elastic reclamation.
+It is not a production security or performance result. See the KVM
+fixture README for independent reproduction and test limits. The older
+M-mode monitor remains a separate bootstrap fixture. Ordinary S-mode
+boots without a PVM DT marker remain native.
 
 Host registration
 =================
@@ -61,8 +71,8 @@ permissive fallback only exists so an S-mode kernel carrying a (test)
 device-tree marker degrades to the verified native path; it is a
 negative-test aid, not a runtime mode of PVM.  With ``pvm=strict`` on
 the command line, any registration failure panics instead: a real
-U-mode guest cannot fall back to running natively, so the future U-mode
-boot path will always register strictly.
+U-mode guest cannot fall back to running natively, and the CSR U-mode
+boot path always registers strictly.
 
 ``early_initcall`` registration is not itself the U-mode boot entry. In
 CSR trap mode the monitor enters ``head.S`` in physical U-mode and handles
