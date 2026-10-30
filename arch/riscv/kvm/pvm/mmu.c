@@ -165,7 +165,13 @@ static unsigned long walk(struct riscv_pvm_vcpu *v, unsigned long va,
 	int lev;
 	*slot = NULL;
 	if (!v->satp) {
-		*pte = 0xcf;
+		/* Bare mode: no architectural PTE exists, so we synthesize
+		 * one for the shadow-fill logic.  Architecturally bare
+		 * mode has no U-bit separation, but our virtual identity
+		 * does: USER gets U=1 (0xdf) so page_fault accepts the
+		 * fill, KERNEL stays U=0 (0xcf).  The GPA itself is
+		 * still strictly bounded by pvm_gpa() as everywhere. */
+		*pte = v->supervisor ? 0xcf : 0xdf;
 		return pvm_gpa(v, va, 1) ? va : 0;
 	}
 	if ((long)va >> 38 != 0 && (long)va >> 38 != -1)
@@ -237,6 +243,7 @@ int pvm_page_fault(struct riscv_pvm_vcpu *v, unsigned long cause,
 		     virt_to_phys(backing) & PAGE_MASK, flags))
 		return -ENOMEM;
 	v->faults++;
+	v->n_fill++; /* D2: successful shadow demand-fill */
 
 	return 1;
 }

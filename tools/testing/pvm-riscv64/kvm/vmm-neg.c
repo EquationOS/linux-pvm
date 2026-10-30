@@ -27,6 +27,8 @@
 #define RAM_BASE 0x80200000UL
 #define RAM_SIZE 0x07e00000UL
 #define PVM_STAGE_C_MAGIC 0x50564D4B564D4D43UL
+#define PVM_STAGE_D_MAGIC 0x50564D4B564D4B44UL
+#define PVM_STAGE_D2_MAGIC 0x50564D4B564D4D55UL
 
 static void die(const char *what)
 {
@@ -59,6 +61,67 @@ static int set_slot(int vmfd, unsigned slot, unsigned flags,
 		.userspace_addr = (uint64_t)va,
 	};
 	return ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &r);
+}
+
+static int run_payload_magic(const char *path, uint64_t magic)
+{
+	int vmfd = new_vm(), vfd, kfd = open("/dev/kvm", O_RDWR);
+	long msz;
+	struct kvm_run *run;
+	static unsigned char *ram;
+	FILE *f;
+	long n;
+	int rc = 1;
+
+	ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE,
+		   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (ram == MAP_FAILED)
+		die("ram mmap");
+	f = fopen(path, "r");
+	if (!f)
+		die(path);
+	fseek(f, 0, SEEK_END);n = ftell(f);fseek(f, 0, SEEK_SET);
+	if (n <= 0 || n > 0x8000)
+		die("payload size");
+	if (fread(ram, 1, n, f) != (size_t)n)
+		die("payload read");
+	fclose(f);
+	if (set_slot(vmfd, 0, 0, RAM_BASE, RAM_SIZE, ram) < 0)
+		die("memslot");
+	vfd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
+	if (vfd < 0)
+		die("vcpu");
+	msz = ioctl(kfd, KVM_GET_VCPU_MMAP_SIZE, 0);
+	run = mmap(NULL, msz, PROT_READ | PROT_WRITE, MAP_SHARED, vfd, 0);
+	if (run == MAP_FAILED)
+		die("run mmap");
+	for (;;) {
+		if (ioctl(vfd, KVM_RUN, 0) < 0) {
+			if (errno == EINTR)
+				continue;
+			die("KVM_RUN");
+		}
+		if (run->exit_reason == KVM_EXIT_SYSTEM_EVENT &&
+		    run->system_event.type == KVM_SYSTEM_EVENT_SHUTDOWN) {
+			uint64_t d0 = run->system_event.ndata ?
+				run->system_event.data[0] : 0;
+			printf("NEG: SYS_EVT data0=0x%llx (%s)\n",
+			       (unsigned long long)d0, path);
+			rc = d0 == magic ? 0 : 1;
+			break;
+		}
+		if (run->exit_reason == KVM_EXIT_RISCV_SBI &&
+		    run->riscv_sbi.extension_id == 0x4442434e) {
+			run->riscv_sbi.ret[0] = 0;
+			run->riscv_sbi.ret[1] = 0;
+			continue;
+		}
+		printf("NEG: unexpected exit %d (%s)\n", run->exit_reason, path);
+		rc = 1;
+		break;
+	}
+	munmap(run, msz);close(vfd);close(vmfd);munmap(ram, RAM_SIZE);
+	return rc;
 }
 
 /* run payload.bin to the stage-C magic; returns 0 on exact match */
@@ -125,6 +188,12 @@ static int run_payload(const char *path)
 
 int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "mmu")) {
+		int rc = run_payload_magic("/payload-mmu.bin", PVM_STAGE_D2_MAGIC);
+		printf("STAGE-MMU: %s\n", rc == 0 ? "PASS" : "FAIL");
+		return rc;
+	}
+
 	if (argc > 1 && !strcmp(argv[1], "child")) {
 		/* Own VM.  Phase 1: the guest reports readiness through a
 		 * REAL exit (SRST private type, marker "READY11"); we write
@@ -220,6 +289,48 @@ int main(int argc, char **argv)
 		close(vmfd);
 	}
 
+	/* N0: capability honesty -- DESTROY_MEMORY_REGION_WORKS must NOT
+	 * be advertised (the backend only supports MR_CREATE). */
+	{
+		int kfd = open("/dev/kvm", O_RDWR);
+		long d;
+
+		if (kfd < 0)
+			die("N0 open");
+		d = ioctl(kfd, KVM_CHECK_EXTENSION,
+			  KVM_CAP_DESTROY_MEMORY_REGION_WORKS);
+		if (d != 0) {
+			printf("NEG-N0: FAIL (DESTROY advertised = %ld)\n", d);
+			close(kfd);
+			return 1;
+		}
+		printf("NEG-N0: PASS (DESTROY not advertised)\n");
+		d = ioctl(kfd, KVM_CHECK_EXTENSION,
+			  KVM_CAP_JOIN_MEMORY_REGIONS_WORKS);
+		if (d != 0) {
+			printf("NEG-N0: FAIL (JOIN advertised = %ld)\n", d);
+			close(kfd);
+			return 1;
+		}
+		printf("NEG-N0: PASS (JOIN not advertised)\n");
+		{
+			static const int unsupported[] = {
+				KVM_CAP_READONLY_MEM, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+				KVM_CAP_IRQFD, KVM_CAP_SIGNAL_MSI, KVM_CAP_IRQ_ROUTING,
+				KVM_CAP_COALESCED_MMIO, KVM_CAP_COALESCED_PIO,
+			};
+			unsigned int i;
+			for (i = 0; i < sizeof(unsupported)/sizeof(unsupported[0]); i++)
+				if (ioctl(kfd, KVM_CHECK_EXTENSION, unsupported[i]) != 0)
+					die("unsupported capability advertised");
+			if (ioctl(kfd, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) != 1 ||
+			    ioctl(kfd, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS) != 1)
+				die("supported capabilities incorrect");
+			puts("NEG-N0: PASS (memory/IRQ capabilities match backend)");
+		}
+		close(kfd);
+	}
+
 	/* N4: child with its OWN VM runs forever; SIGTERM; then a fresh
 	 * VM must still reach the stage-C magic */
 	{
@@ -269,11 +380,66 @@ int main(int argc, char **argv)
 		printf("NEG-N4a: PASS (SIGTERM interrupted a live KVM_RUN)\n");
 	}
 
-	if (run_payload("/payload-c.bin") == 0) {
-		printf("NEG-N4b: PASS (fresh VM after SIGTERM reached the magic)\n");
-		printf("NEG: ALL-PASS\n");
-		return 0;
+	if (run_payload("/payload-c.bin") != 0) {
+		printf("NEG-N4b: FAIL\n");
+		return 1;
 	}
-	printf("NEG-N4b: FAIL\n");
+	printf("NEG-N4b: PASS (fresh VM after SIGTERM reached the magic)\n");
+
+	/* D-payload: D1 correctness assertions run under a fresh VM */
+	{
+		int vmfd = new_vm(), vfd, kfd = open("/dev/kvm", O_RDWR);
+		long msz;
+		struct kvm_run *run;
+		static unsigned char *ram;
+		FILE *f = fopen("/payload-d.bin", "r");
+		long n;
+
+		if (!f)
+			die("payload-d open");
+		fseek(f, 0, SEEK_END);n = ftell(f);fseek(f, 0, SEEK_SET);
+		if (n <= 0 || n > 0x4000)
+			die("payload-d size");
+		ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE,
+			   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+		if (ram == MAP_FAILED)
+			die("payload-d ram");
+		if (fread(ram, 1, n, f) != (size_t)n)
+			die("payload-d read");
+		fclose(f);
+		if (set_slot(vmfd, 0, 0, RAM_BASE, RAM_SIZE, ram) < 0)
+			die("payload-d memslot");
+		vfd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
+		if (vfd < 0)
+			die("payload-d vcpu");
+		msz = ioctl(kfd, KVM_GET_VCPU_MMAP_SIZE, 0);
+		run = mmap(NULL, msz, PROT_READ | PROT_WRITE, MAP_SHARED, vfd, 0);
+		if (run == MAP_FAILED)
+			die("payload-d run mmap");
+		for (;;) {
+			if (ioctl(vfd, KVM_RUN, 0) < 0) {
+				if (errno == EINTR)
+					continue;
+				die("payload-d KVM_RUN");
+			}
+			if (run->exit_reason == KVM_EXIT_SYSTEM_EVENT &&
+			    run->system_event.type == KVM_SYSTEM_EVENT_SHUTDOWN) {
+				uint64_t d0 = run->system_event.ndata ?
+					run->system_event.data[0] : 0;
+				printf("STAGE-D: SYSTEM_EVENT data0=0x%llx\n",
+				       (unsigned long long)d0);
+				if (d0 == PVM_STAGE_D_MAGIC) {
+					printf("STAGE-D: PASS (illegal inject + WARL + stats window verified)\n");
+					printf("NEG: ALL-PASS\n");
+					return 0;
+				}
+				printf("STAGE-D: FAIL (wrong marker 0x%llx)\n",
+				       (unsigned long long)d0);
+				return 1;
+			}
+			printf("STAGE-D: unexpected exit %d\n", run->exit_reason);
+			return 1;
+		}
+	}
 	return 1;
 }

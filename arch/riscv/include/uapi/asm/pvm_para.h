@@ -51,6 +51,8 @@
 #define PVM_HC_PROBE			(PVM_HC_SPECIAL_BASE+9)
 #define PVM_HC_DEREGISTER		(PVM_HC_SPECIAL_BASE+10)
 #define PVM_HC_GET_FEATURES		(PVM_HC_SPECIAL_BASE+11)
+#define PVM_HC_STATS_RESET		(PVM_HC_SPECIAL_BASE+12)
+#define PVM_HC_STATS_READ		(PVM_HC_SPECIAL_BASE+13)
 
 /* Optional trap-and-emulate bootstrap, negotiated before registration. */
 #define PVM_FEATURE_CSR_TRAPS		_BITUL(0)
@@ -103,6 +105,12 @@
  *
  * PVM_HC_DEREGISTER rolls back a partially or fully completed
  * registration of this vCPU (PVCS binding, TP and event entry).
+ *
+ * PVM_HC_STATS_RESET starts a measurement window (records counter
+ * bases; no argument).  PVM_HC_STATS_READ writes a 16-slot u64 delta
+ * snapshot to the stats buffer whose page-aligned GPA is passed in
+ * a0 (single-argument convention); requires registration and an
+ * active window; slot 14 carries the schema version (2).
  *
  * GET_FEATURES returns an optional capability mask (negative means that
  * the query is unsupported). CSR_EVENTS uses virtual stvec/sepc/sstatus

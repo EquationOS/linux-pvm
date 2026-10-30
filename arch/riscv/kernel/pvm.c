@@ -29,6 +29,8 @@
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/percpu.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
 
 #include <asm/current.h>
 #include <asm/ptrace.h>
@@ -184,6 +186,87 @@ static void __init pvm_no_host(const char *what, long ret, bool registered)
  * needs its own loader entry before any head.S/CSR work, see
  * Documentation/arch/riscv/pvm.rst.
  */
+/* ---- D2: measurement window via /proc/pvm_stats ---- */
+static u64 *pvm_stats_page;
+static bool pvm_stats_on;
+
+static bool pvm_stats_valid;
+
+static ssize_t pvm_stats_write(struct file *f, const char __user *ub,
+			       size_t n, loff_t *off)
+{
+	char cmd[8];
+
+	if (n < 4 || n > 7 || copy_from_user(cmd, ub, n))
+		return -EINVAL;
+	cmd[n] = 0;
+	if (!strncmp(cmd, "reset", 5)) {
+		long r = pvm_hypercall0(PVM_HC_STATS_RESET);
+		if (r) return -EIO;
+		pvm_stats_on = true;
+		return n;
+	}
+	if (!strncmp(cmd, "read", 4)) {
+		long r;
+		if (!pvm_stats_on) return -EIO;
+		r = pvm_hypercall1(PVM_HC_STATS_READ,
+			pvm_ptr_to_phys(pvm_stats_page));
+		if (r) return -EIO;
+		pvm_stats_on = false;
+		pvm_stats_valid = (pvm_stats_page[14] == 2);
+		return n;
+	}
+	return -EINVAL;
+}
+
+static ssize_t pvm_stats_read(struct file *f, char __user *ub,
+			      size_t n, loff_t *off)
+{
+	/* Dump the last snapshot as one JSON line (schema v2). */
+	char buf[640];
+	int len;
+
+	if (!pvm_stats_page || !pvm_stats_valid)
+		return 0;
+	len = scnprintf(buf, sizeof(buf),
+		"{\"type\":\"pvm_stats\",\"schema\":%llu,"
+		"\"user_ecall\":%llu,\"sbi\":%llu,\"hypercall\":%llu,"
+		"\"csr\":%llu,\"sret\":%llu,\"sfence\":%llu,"
+		"\"satp\":%llu,\"fill\":%llu,\"inj_fault\":%llu,"
+		"\"inj_irq\":%llu,\"host_irq\":%llu,\"vmm_exit\":%llu,"
+		"\"wfi\":%llu,\"exits\":%llu,\"inj_ill\":%llu,"
+		"\"derived_root_writes\":%llu,\"derived_label\":\"4x_exits\"}\n",
+		pvm_stats_page[14], pvm_stats_page[0], pvm_stats_page[1],
+		pvm_stats_page[2], pvm_stats_page[3], pvm_stats_page[4],
+		pvm_stats_page[5], pvm_stats_page[6], pvm_stats_page[7],
+		pvm_stats_page[8], pvm_stats_page[9], pvm_stats_page[10],
+		pvm_stats_page[11], pvm_stats_page[12], pvm_stats_page[13],
+		pvm_stats_page[15],
+		4ULL * pvm_stats_page[13]); /* derived: the fixed asm gate
+			* path performs 4 satp writes per C-level exit; this
+			* is an inference from exits, NOT a counted event.
+			* Stage E's fast gate will count real asm events. */
+	return simple_read_from_buffer(ub, n, off, buf, len);
+}
+
+static const struct proc_ops pvm_stats_ops = {
+	.proc_write = pvm_stats_write,
+	.proc_read = pvm_stats_read,
+};
+
+static int pvm_stats_init(void)
+{
+	if (!pvm_guest_detected)
+		return 0;
+	pvm_stats_page = (u64 *)get_zeroed_page(GFP_KERNEL);
+	if (!pvm_stats_page)
+		return -ENOMEM;
+	proc_create("pvm_stats", 0600, NULL, &pvm_stats_ops);
+	pr_info("pvm-guest: stats window available at /proc/pvm_stats\n");
+	return 0;
+}
+late_initcall(pvm_stats_init);
+
 static int __init pvm_guest_init(void)
 {
 	unsigned long pvcs_pa, kernel_tp;
@@ -191,6 +274,7 @@ static int __init pvm_guest_init(void)
 
 	if (!pvm_guest_detected)
 		return 0;
+
 
 	ret = pvm_hypercall1(PVM_HC_PROBE, PVM_ABI_VERSION);
 	if (ret < 0) {

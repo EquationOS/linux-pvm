@@ -34,6 +34,16 @@ struct riscv_pvm_vcpu {
 	unsigned long pvcs, kernel_tp;
 	bool supervisor, registered, sbi_pending, halted;
 	u64 exits, faults, user_entries, timer_irqs, schedules, switches;
+	/* D2 classification counters (host-private, reset by
+	 * PVM_HC_STATS_WINDOW): */
+	u64 n_user_ecall, n_sbi, n_hypercall, n_csr, n_sret, n_sfence;
+	u64 n_satp_write, n_fill, n_inj_fault, n_inj_irq, n_host_irq;
+	u64 n_vmm_exit, n_wfi, n_inj_ill;
+	/* window bookkeeping: bases for EVERY exported counter */
+	u64 win_active;
+	u64 w_user_ecall, w_sbi, w_hypercall, w_csr, w_sret, w_sfence;
+	u64 w_satp_write, w_fill, w_inj_fault, w_inj_irq, w_host_irq;
+	u64 w_vmm_exit, w_wfi, w_inj_ill, w_exits;
 };
 int pvm_mmu_init(struct riscv_pvm_vcpu *v);
 void pvm_mmu_destroy(struct riscv_pvm_vcpu *v);

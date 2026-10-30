@@ -244,8 +244,10 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_ONE_REG:
 	case KVM_CAP_IMMEDIATE_EXIT:
 	case KVM_CAP_MP_STATE:
-	case KVM_CAP_DESTROY_MEMORY_REGION_WORKS:
 		return 1;
+	/* KVM_CAP_DESTROY_MEMORY_REGION_WORKS is deliberately NOT
+	 * advertised: the backend only supports KVM_MR_CREATE (see
+	 * kvm_arch_prepare_memory_region rejecting everything else). */
 	case KVM_CAP_MAX_VCPUS:
 	case KVM_CAP_NR_VCPUS:
 	case KVM_CAP_NR_MEMSLOTS:
@@ -455,6 +457,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		}
 	}
 	kvm_sigset_deactivate(vcpu);
+	if (ret >= 0)
+		v->n_vmm_exit++; /* successful userspace-visible exit (not
+				  * -EINTR/-EFAULT ioctl errors) */
 	vcpu_put(vcpu);
 	kvm_vcpu_srcu_read_unlock(vcpu);
 	return ret;

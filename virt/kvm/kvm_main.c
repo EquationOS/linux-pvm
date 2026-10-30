@@ -4877,6 +4877,28 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
 
 static int kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
 {
+#ifdef CONFIG_RISCV_PVM_HOST
+	/* This fixed-memory software backend cannot implement these generic
+	 * facilities. Filter before the generic answers override arch checks.
+	 * Leave the other architectures and the native RISC-V backend intact.
+	 */
+	switch (arg) {
+	case KVM_CAP_NR_MEMSLOTS:
+		return 1;
+	case KVM_CAP_DESTROY_MEMORY_REGION_WORKS:
+	case KVM_CAP_JOIN_MEMORY_REGIONS_WORKS:
+	case KVM_CAP_READONLY_MEM:
+	case KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2:
+	case KVM_CAP_IRQFD:
+	case KVM_CAP_SIGNAL_MSI:
+	case KVM_CAP_IRQ_ROUTING:
+	case KVM_CAP_COALESCED_MMIO:
+	case KVM_CAP_COALESCED_PIO:
+		return 0;
+	default:
+		break;
+	}
+#endif
 	switch (arg) {
 	case KVM_CAP_USER_MEMORY:
 	case KVM_CAP_USER_MEMORY2:
