@@ -148,6 +148,9 @@ static int pv_map_frame(struct riscv_pvm_vcpu *v, unsigned long va,
 		size_t len = min_t(size_t, left,
 				    PAGE_SIZE - offset_in_page(va + done));
 
+		if (((va + done) & PAGE_MASK) == PVM_GATE_VA ||
+		    ((va + done) & PAGE_MASK) == PVM_STATE_VA)
+			return -EFAULT;
 		if (!gpa || (pte & _PAGE_USER) ||
 		    (pte & (_PAGE_READ | _PAGE_WRITE)) !=
 			(_PAGE_READ | _PAGE_WRITE))
@@ -176,6 +179,73 @@ static void pv_copy_frame(struct pv_frame_map *m, struct pt_regs *fr,
 		if (off == sizeof(*fr))
 			break;
 	}
+}
+
+/*
+ * E2: re-validate the fast-path cache before every C->asm switch.
+ * Walks the frame + entry with the same E1 translation path, requires
+ * a single-page 288B frame, kernel-virtual U=0, and PV/fast context.
+ * Conservative: SUM/MXR differences or any validation failure returns
+ * false and the gate stays on the C slow path.
+ */
+bool pvm_prepare_fast_cache(struct riscv_pvm_vcpu *v)
+{
+	struct pv_frame_map m;
+	unsigned long pte = 0;
+
+	/* fast_enabled: the gate-level precondition (context, not cache) */
+	v->s->fast_enabled = (v->registered && v->pv_mode && v->pv_fast &&
+			      v->pv_context_valid) ? 1 : 0;
+	/* pending_irq: mirror of the C delivery condition */
+	v->s->fast_pending_irq =
+		(v->csr[4] & v->csr[0x44] & 0x20) ? 1 : 0;
+	/* cache_valid always starts false */
+	v->s->fast_cache_valid = 0;
+
+	/* Allow BOTH virtual identities: PV_RETURN transitions to USER,
+	 * and the next user ecall must still be able to use the fast
+	 * path.  The cache validation below (frame/entry walk) is the
+	 * authority, not the current identity. */
+	if (!v->s->fast_enabled)
+		return false;
+	if (!v->pv_entry_gva || !v->pv_frame_gva)
+		return false;
+	/* conservative: SUM/MXR set -> C path (shadow root invariant) */
+	if (v->csr[0] & (SR_SUM | PVM_MXR))
+		return false;
+
+	/* entry must be executable kernel-virtual; the translated GPA
+	 * must also be bounds-checked (same as E1 pv_map_frame). */
+	{
+		unsigned long eg = pvm_translate(v, v->pv_entry_gva, &pte);
+
+		if (!eg || (pte & 0x10) || !(pte & 0x8) ||
+		    !pvm_gpa(v, eg, 2))
+			return false;
+	}
+
+	if ((v->pv_entry_gva & PAGE_MASK) == PVM_GATE_VA ||
+	    (v->pv_entry_gva & PAGE_MASK) == PVM_STATE_VA)
+		return false;
+
+	/* frame: single-page 288B, kernel-virtual R|W */
+	if (pv_map_frame(v, v->pv_frame_gva, &m))
+		return false;
+	if (m.len[1] != 0 || m.len[0] != sizeof(struct pt_regs))
+		return false; /* cross-page -> C only */
+
+	/* populate the switch state fast fields */
+	v->s->fast_kernel_root = (8UL << 60) |
+		(virt_to_phys(v->kernel.root) >> 12);
+	v->s->fast_user_root = (8UL << 60) |
+		(virt_to_phys(v->user.root) >> 12);
+	v->s->fast_kernel_tp = v->kernel_tp;
+	v->s->fast_kernel_gp = v->kernel_gp;
+	v->s->fast_frame_gva = v->pv_frame_gva;
+	v->s->fast_entry_gva = v->pv_entry_gva;
+	v->s->fast_frame_kva = (unsigned long)m.kva[0];
+	v->s->fast_cache_valid = 1;
+	return true;
 }
 static void pv_set_status(struct riscv_pvm_vcpu *v, unsigned long st)
 {
@@ -339,6 +409,8 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 
 		if (!v->registered || !v->pv_mode) { ret = -EPERM; break; }
 		if ((entry & 1) || R(11) || R(12)) { ret = -EINVAL; break; }
+		if ((entry & PAGE_MASK) == PVM_GATE_VA ||
+		    (entry & PAGE_MASK) == PVM_STATE_VA) { ret = -EFAULT; break; }
 		gpa = pvm_translate(v, entry, &flags);
 		if (!gpa || (flags & _PAGE_USER) || !(flags & _PAGE_EXEC) ||
 		    !pvm_gpa(v, gpa, 2)) { ret = -EFAULT; break; }
@@ -397,13 +469,21 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 		v->w_pv_entry = v->n_pv_entry;
 		v->w_pv_return = v->n_pv_return;
 		v->w_pv_reject = v->n_pv_reject;
+		v->w_phys_traps = v->n_phys_traps;
+		v->w_root_writes = v->n_root_writes;
+		v->w_sfences_asm = v->n_sfences_asm;
+		v->w_fast_in = v->n_fast_in;
+		v->w_fast_out = v->n_fast_out;
+		v->w_fast_irq = v->n_fast_irq;
+		v->w_fast_fallback = v->n_fast_fallback;
+		v->w_pv_reject = v->n_pv_reject;
 		v->win_active = 1;
 		ret = 0;
 		break;
 	}
 	case PVM_HC_STATS_READ: {
 		/* Write per-counter deltas to a DEDICATED stats buffer
-		 * whose GPA the guest passes in a1 (page-aligned, 4KiB,
+		 * whose GPA the guest passes in a0 (page-aligned, 4KiB,
 		 * must not overlap the PVCS page -- PVCS carries the
 		 * event ABI reserved for stage E).  Counters stay
 		 * host-authoritative; the copy is a guest-writable
@@ -420,8 +500,8 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 			break;
 		}
 		dst = (u64 *)pvm_gpa(v, gpa, 4096);
-		/* Schema v2: 16 u64 slots; ALL values are deltas within
-		 * [RESET, READ).  Slot 14 = schema version (2); slot 15
+		/* Schema v3: prefix slots 0-18 are unchanged; deltas lie within
+		 * [RESET, READ).  Slot 14 = schema version (3); slot 15
 		 * = illegal injections in-window. */
 		dst[0] = v->n_user_ecall - v->w_user_ecall;
 		dst[1] = v->n_sbi - v->w_sbi;
@@ -437,11 +517,21 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 		dst[11] = v->n_vmm_exit - v->w_vmm_exit;
 		dst[12] = v->n_wfi - v->w_wfi;
 		dst[13] = v->exits - v->w_exits;
-		dst[14] = 2; /* schema version */
+		dst[14] = 3; /* schema version */
 		dst[15] = v->n_inj_ill - v->w_inj_ill;
 		dst[16] = v->n_pv_entry - v->w_pv_entry;
 		dst[17] = v->n_pv_return - v->w_pv_return;
 		dst[18] = v->n_pv_reject - v->w_pv_reject;
+		/* schema 3 asm-real extension (slots 19-28) */
+		dst[19] = v->n_phys_traps - v->w_phys_traps;
+		dst[20] = v->n_root_writes - v->w_root_writes;
+		dst[21] = v->n_sfences_asm - v->w_sfences_asm;
+		dst[22] = v->n_fast_in - v->w_fast_in;
+		dst[23] = v->n_fast_out - v->w_fast_out;
+		dst[24] = v->n_fast_irq - v->w_fast_irq;
+		dst[25] = v->n_fast_fallback - v->w_fast_fallback;
+		dst[26] = 0; dst[27] = 0; dst[28] = 0;
+		dst[29] = 0; dst[30] = 0; dst[31] = 0;
 		v->win_active = 0;
 		ret = 0;
 		break;
@@ -579,6 +669,7 @@ int pvm_emulate(struct riscv_pvm_vcpu *v)
 		    (op == 2 || op == 3 || op == 6 || op == 7) && !rs &&
 		    csr >= 0xc00 && csr <= 0xc02 &&
 		    (v->csr[6] & (1UL << (csr - 0xc00)))) {
+			v->n_csr++; /* permitted USER counter reads are traps too */
 			if (readcsr(v, csr, &x))
 				return -EINVAL;
 			if (rd)

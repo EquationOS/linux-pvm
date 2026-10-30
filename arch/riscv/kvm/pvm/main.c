@@ -9,6 +9,10 @@
 #include <linux/uaccess.h>
 #include <asm/cpufeature.h>
 
+static bool pv_fast;
+module_param(pv_fast, bool, 0444);
+MODULE_PARM_DESC(pv_fast, "Enable PV fast gate (0=slow, 1=fast, default 0)");
+
 const struct _kvm_stats_desc kvm_vm_stats_desc[] = { KVM_GENERIC_VM_STATS() };
 const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	KVM_GENERIC_VCPU_STATS()
@@ -26,9 +30,9 @@ const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	}
 HEADER(vm);
 HEADER(vcpu);
-/* Generic KVM core hooks with no PVM backend yet: the guest has no
- * irqchip (SBI DBCN/hvc console; TIME via host scheduling) and stage
- * A has no vCPU timer, so both are inert. */
+/* Generic irqchip/MSI hooks are unused: the bounded backend handles
+ * virtual TIME through timer() and the guest console through SBI exits.
+ */
 int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
 {
 	return 0;
@@ -85,7 +89,7 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 	if (!v)
 		return -ENOMEM;
 	v->vcpu = vcpu;
-	v->supervisor = true;
+	v->supervisor = true; v->pv_fast = pv_fast;
 	v->deadline = ~0UL;
 	v->csr[6] = 7;
 	err = pvm_mmu_init(v);
@@ -110,6 +114,11 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 {
 	struct riscv_pvm_vcpu *v = vcpu->arch.pvm;
 	if (v) {
+		if (v->pv_mode)
+			pr_info("PVM_GATE_FINAL fast=%u in=%lu out=%lu irq=%lu physical=%lu c_exits=%llu host_irq=%llu\n",
+				v->pv_fast, v->s->fast_in, v->s->fast_out,
+				v->s->fast_irq, v->s->fast_phys_traps,
+				v->exits, v->n_host_irq);
 		pvm_mmu_destroy(v);
 		kfree(v);
 	}
@@ -425,6 +434,17 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		v->s->guest_satp = pvm_real_satp(v);
 		v->s->g[33] = (2UL << 32) | SR_SPIE |
 			      (v->csr[0] & (SR_FS | PVM_MXR));
+		/* E2: sync virtual state C->asm before every switch */
+		v->s->fast_virt_sup = v->supervisor ? 1 : 0;
+		v->s->fast_virt_status = v->csr[0];
+		v->s->fast_virt_sepc = v->csr[0x41];
+		v->s->fast_virt_sscratch = v->csr[0x40]; /* sscratch = csr[0x140-0x100] */
+		v->s->fast_virt_scause = v->csr[0x42];
+		v->s->fast_virt_stval = v->csr[0x43];
+		/* E2: refresh the fast cache (full rewalk; conservative) */
+		v->s->fast_cache_valid = 0;
+		if (v->pv_fast)
+			(void)pvm_prepare_fast_cache(v);
 		guest_timing_enter_irqoff();
 		riscv_pvm_switch(v->s,
 				 (8UL << 60) |
@@ -432,6 +452,44 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		vcpu->mode = OUTSIDE_GUEST_MODE;
 		v->exits++;
 		v->switches++;
+		/* E2: full asm->C sync after every switch.  The fast gate
+		 * may have changed identity/CSR/counters without C; we
+		 * read back the entire virtual state and fold the asm
+		 * counter DELTAS into the cumulative categorical counters
+		 * (each fast syscall counts as user_ecall, each fast
+		 * PV_RETURN/IRQ helper as hypercall, each fast user return
+		 * as user_entries -- exactly once, never double-counted
+		 * because the C emulator path never sees these traps). */
+		{
+			u64 d_fast_in, d_fast_out, d_fast_irq;
+
+			v->supervisor = v->s->fast_virt_sup != 0;
+			v->csr[0] = v->s->fast_virt_status;
+			v->csr[0x41] = v->s->fast_virt_sepc;
+			v->csr[0x40] = v->s->fast_virt_sscratch;
+			v->csr[0x42] = v->s->fast_virt_scause;
+			v->csr[0x43] = v->s->fast_virt_stval;
+
+			/* fold asm deltas into categorical totals */
+			d_fast_in = v->s->fast_in - v->n_fast_in;
+			d_fast_out = v->s->fast_out - v->n_fast_out;
+			d_fast_irq = v->s->fast_irq - v->n_fast_irq;
+
+			v->n_user_ecall += d_fast_in;
+			v->n_pv_entry += d_fast_in;
+			v->n_pv_return += d_fast_out;
+			v->user_entries += d_fast_out;
+			v->n_hypercall += d_fast_irq + d_fast_out;
+
+			/* update mirrors for the next delta */
+			v->n_fast_in = v->s->fast_in;
+			v->n_fast_out = v->s->fast_out;
+			v->n_fast_irq = v->s->fast_irq;
+			v->n_fast_fallback = v->s->fast_fallback;
+			v->n_phys_traps = v->s->fast_phys_traps;
+			v->n_root_writes = v->s->fast_root_writes;
+			v->n_sfences_asm = v->s->fast_sfences;
+		}
 		local_irq_enable();
 		local_irq_disable();
 		guest_timing_exit_irqoff();
