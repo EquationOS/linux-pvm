@@ -376,12 +376,14 @@ config PVM_GUEST
 	depends on 64BIT
 	default n
 	help
-	  This option enables the kernel to run as a PVM guest under the PVM
-	  hypervisor, where the kernel itself executes in U-mode and
-	  privileged operations trap into the host.  Host detection is
-	  device-tree based, so a kernel built with this option still boots
-	  natively when no PVM host is present.  See
-	  Documentation/arch/riscv/pvm.rst for details.
+	  This option builds the guest-side scaffolding for running as a
+	  PVM guest, where the kernel itself would execute in U-mode and
+	  privileged operations would trap into the host: device-tree
+	  based host detection, the hypercall ABI and host registration.
+	  The host side does not exist yet, so a kernel built with this
+	  option still boots natively (S-mode under OpenSBI or on real
+	  hardware) and falls back cleanly when registration is refused.
+	  See Documentation/arch/riscv/pvm.rst for details.
 
 menu "Platform type"
 

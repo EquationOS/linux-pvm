@@ -23,17 +23,37 @@ The RV64 port currently provides guest-side scaffolding:
   * device-tree based host detection,
   * the hypercall transport (see below),
   * the per-VCPU communication structure (PVCS) layout,
+  * host registration (PVCS and event entry, with a fail-safe native
+    fallback when no host answers),
+  * an event entry point (``pvm_event_entry``) and dispatch skeleton,
   * dormant PV operations (TLB flush, page-table switch, halt) mirroring
     the x86_64 ``pv_ops`` set.
 
 The host side for RV64 (the KVM PVM vendor module and the switcher) does
 not exist yet.  Consequently the PV operations are not hooked into the
 live kernel paths: a kernel built with ``CONFIG_PVM_GUEST=y`` boots
-natively (S-mode under OpenSBI or on real hardware) and only executes the
-detection path, which prints one line to the boot log.  Wiring the
-operations in, defining event delivery and the return-to-user path, and
-relocating the kernel image into a host-provided address range are future
-work to be done together with the host side.
+natively (S-mode under OpenSBI or on real hardware).  It executes the
+detection path and, when a device-tree marker claims a PVM host is
+present, attempts registration once; under OpenSBI the unknown-EID ecall
+returns ``SBI_ERR_NOT_SUPPORTED`` and the kernel continues natively.
+Functional event handlers, the guest-user return path, and relocating
+the kernel image into a host-provided address range are future work to
+be done together with the host side.
+
+Host registration
+=================
+
+``pvm_early_setup()`` (called from ``setup_arch()``) only scans the
+device tree.  Hypercalls are issued later from ``pvm_guest_init()``
+(``early_initcall``, once per-CPU areas are up):
+
+  1. ``PVM_HC_REGISTER_PVCS`` with the physical address of the boot
+     CPU's PVCS.  Secondary harts are future work.
+  2. ``PVM_HC_SET_EVENT_ENTRY`` with the address of
+     ``pvm_event_entry``.
+
+Any refusal clears the detection state and the kernel continues
+natively; the event entry is never executed without a host.
 
 Host detection
 ==============
@@ -63,6 +83,8 @@ a1    optional second return value
 The arch-neutral hypercall numbers of the x86_64 ABI are kept
 (``PVM_HC_LOAD_PGTBL``, ``PVM_HC_IRQ_WIN``, ``PVM_HC_IRQ_HALT``,
 ``PVM_HC_TLB_FLUSH``, ``PVM_HC_TLB_FLUSH_CURRENT``, ``PVM_HC_TLB_INVLPG``);
-the x86_64 segment/MSR entries have no RV64 counterpart.  Hypercalls must
-never be issued when running natively, or the ecall traps into
-SBI/OpenSBI.
+the x86_64 segment/MSR entries have no RV64 counterpart.  The RV64-only
+additions are ``PVM_HC_REGISTER_PVCS``, ``PVM_HC_SET_EVENT_ENTRY`` and
+``PVM_HC_RETU`` (see `Host registration`_).  Hypercalls must only be
+issued after successful registration; issued under OpenSBI they return
+``SBI_ERR_NOT_SUPPORTED`` rather than crashing.

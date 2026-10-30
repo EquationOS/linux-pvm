@@ -45,10 +45,29 @@
 #define PVM_HC_TLB_FLUSH		(PVM_HC_SPECIAL_BASE+3)
 #define PVM_HC_TLB_FLUSH_CURRENT	(PVM_HC_SPECIAL_BASE+4)
 #define PVM_HC_TLB_INVLPG		(PVM_HC_SPECIAL_BASE+5)
+#define PVM_HC_REGISTER_PVCS		(PVM_HC_SPECIAL_BASE+6)
+#define PVM_HC_SET_EVENT_ENTRY		(PVM_HC_SPECIAL_BASE+7)
+#define PVM_HC_RETU			(PVM_HC_SPECIAL_BASE+8)
 
-/* PVM_HC_LOAD_PGTBL flags */
-#define PVM_LOAD_PGTBL_FLAGS_ASID	_BITUL(0)
-#define PVM_LOAD_PGTBL_FLAGS_SV57	_BITUL(1)
+/*
+ * PVM_HC_LOAD_PGTBL flags are reserved and must be zero; the host decodes
+ * the raw satp value itself (MODE, ASID and PPN fields per the Sv48/Sv57
+ * layout) so that flush/ASID policy stays on the host side.
+ */
+
+/*
+ * PVM_HC_REGISTER_PVCS registers the per-CPU PVCS with the host:
+ *	arg0	flags, reserved, must be zero
+ *	arg1	physical address of this CPU's struct pvm_vcpu_struct
+ *
+ * PVM_HC_SET_EVENT_ENTRY installs the event entry point:
+ *	arg0	flags, reserved, must be zero
+ *	arg1	virtual address of pvm_event_entry
+ *
+ * PVM_HC_RETU asks the host to resume the context described by the frame
+ * passed in arg0 (the ERETU analog).  Only valid after a successful
+ * REGISTER_PVCS; a host must never let it return.
+ */
 
 /*
  * PVM_EVENT_FLAGS_SIE
