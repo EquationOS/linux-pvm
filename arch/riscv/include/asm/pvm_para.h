@@ -13,7 +13,18 @@ extern bool pvm_guest_detected;
 
 void __init pvm_early_setup(void);
 
-DECLARE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
+/* arch/riscv/kernel/pvm.c */
+void pvm_safe_halt(void);
+void pvm_flush_tlb_all(void);
+void pvm_flush_tlb_current(void);
+void pvm_flush_tlb_page(unsigned long addr);
+void pvm_load_pgtbl(unsigned long satp);
+struct pt_regs;
+__visible struct pt_regs *pvm_event_dispatch(unsigned long cause,
+					     struct pt_regs *regs);
+
+/* arch/riscv/kernel/pvm-entry.S */
+void pvm_event_entry(void);
 
 /*
  * pvm_hypercallN() must only be called after pvm_early_setup() has detected
@@ -22,11 +33,12 @@ DECLARE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 static __always_inline long pvm_hypercall0(unsigned long nr)
 {
 	register unsigned long a0 asm ("a0");
+	register unsigned long a1 asm ("a1");
 	register unsigned long a6 asm ("a6") = nr;
 	register unsigned long a7 asm ("a7") = PVM_HC_EID;
 
 	asm volatile ("ecall"
-		      : "+r" (a0)
+		      : "=r" (a0), "=r" (a1)
 		      : "r" (a6), "r" (a7)
 		      : "memory");
 	return a0;
@@ -35,11 +47,12 @@ static __always_inline long pvm_hypercall0(unsigned long nr)
 static __always_inline long pvm_hypercall1(unsigned long nr, unsigned long arg0)
 {
 	register unsigned long a0 asm ("a0") = arg0;
+	register unsigned long a1 asm ("a1");
 	register unsigned long a6 asm ("a6") = nr;
 	register unsigned long a7 asm ("a7") = PVM_HC_EID;
 
 	asm volatile ("ecall"
-		      : "+r" (a0)
+		      : "+r" (a0), "=r" (a1)
 		      : "r" (a6), "r" (a7)
 		      : "memory");
 	return a0;
@@ -54,8 +67,8 @@ static __always_inline long pvm_hypercall2(unsigned long nr, unsigned long arg0,
 	register unsigned long a7 asm ("a7") = PVM_HC_EID;
 
 	asm volatile ("ecall"
-		      : "+r" (a0)
-		      : "r" (a1), "r" (a6), "r" (a7)
+		      : "+r" (a0), "+r" (a1)
+		      : "r" (a6), "r" (a7)
 		      : "memory");
 	return a0;
 }
@@ -70,8 +83,8 @@ static __always_inline long pvm_hypercall3(unsigned long nr, unsigned long arg0,
 	register unsigned long a7 asm ("a7") = PVM_HC_EID;
 
 	asm volatile ("ecall"
-		      : "+r" (a0)
-		      : "r" (a1), "r" (a2), "r" (a6), "r" (a7)
+		      : "+r" (a0), "+r" (a1)
+		      : "r" (a2), "r" (a6), "r" (a7)
 		      : "memory");
 	return a0;
 }
