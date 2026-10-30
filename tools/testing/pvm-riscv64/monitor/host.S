@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0
+#include "trap.h"
+.option norelax
+.section .text.host
+.globl _start
+_start:
+ la sp,HOST_STACK_TOP
+ csrw mscratch,sp
+ la t0,mtrap_vec
+ csrw mtvec,t0
+ la t0,__bss_start
+ la t1,__bss_end
+1:bgeu t0,t1,2f
+ sd zero,0(t0)
+ addi t0,t0,8
+ j 1b
+2:
+ # UART RW NAPOT; shadow pool read-only TOR; guest RAM RWX TOR.
+ li t0,0x4001fff
+ csrw pmpaddr0,t0
+ li t0,0x20040000
+ csrw pmpaddr1,t0
+ li t0,0x20080000
+ csrw pmpaddr2,t0
+ li t0,0x22000000
+ csrw pmpaddr3,t0
+ li t0,0x37fffff
+ csrw pmpaddr4,t0
+ li t0,0x1b0f09001b
+ csrw pmpcfg0,t0
+ li t0,0xf0
+ csrw menvcfg,t0
+ csrw senvcfg,t0
+ li t0,7
+ csrw mcounteren,t0
+ li t0,0x80
+ csrw mie,t0
+ csrw medeleg,zero
+ csrw mideleg,zero
+ call host_main
+1:j 1b
+.align 2
+mtrap_vec:
+ csrrw sp,mscratch,sp
+ addi sp,sp,-TF_SIZE
+ sd zero,0(sp)
+ sd ra,8(sp)
+ sd gp,24(sp)
+ sd tp,32(sp)
+ sd t0,40(sp)
+ sd t1,48(sp)
+ sd t2,56(sp)
+ sd s0,64(sp)
+ sd s1,72(sp)
+ sd a0,80(sp)
+ sd a1,88(sp)
+ sd a2,96(sp)
+ sd a3,104(sp)
+ sd a4,112(sp)
+ sd a5,120(sp)
+ sd a6,128(sp)
+ sd a7,136(sp)
+ sd s2,144(sp)
+ sd s3,152(sp)
+ sd s4,160(sp)
+ sd s5,168(sp)
+ sd s6,176(sp)
+ sd s7,184(sp)
+ sd s8,192(sp)
+ sd s9,200(sp)
+ sd s10,208(sp)
+ sd s11,216(sp)
+ sd t3,224(sp)
+ sd t4,232(sp)
+ sd t5,240(sp)
+ sd t6,248(sp)
+ csrr t0,mscratch
+ sd t0,16(sp)
+ csrr t0,mepc
+ sd t0,TF_EPC_OFF(sp)
+ csrr t0,mstatus
+ sd t0,TF_STATUS_OFF(sp)
+ csrr t0,mcause
+ sd t0,TF_CAUSE_OFF(sp)
+ csrr t0,mtval
+ sd t0,TF_TVAL_OFF(sp)
+ la t0,trapframe
+ sd sp,0(t0)
+ call mtrap_c
+ ld t0,TF_EPC_OFF(sp)
+ csrw mepc,t0
+ ld t0,TF_STATUS_OFF(sp)
+ csrw mstatus,t0
+ ld t0,16(sp)
+ csrw mscratch,t0
+ ld ra,8(sp)
+ ld gp,24(sp)
+ ld tp,32(sp)
+ ld t0,40(sp)
+ ld t1,48(sp)
+ ld t2,56(sp)
+ ld s0,64(sp)
+ ld s1,72(sp)
+ ld a0,80(sp)
+ ld a1,88(sp)
+ ld a2,96(sp)
+ ld a3,104(sp)
+ ld a4,112(sp)
+ ld a5,120(sp)
+ ld a6,128(sp)
+ ld a7,136(sp)
+ ld s2,144(sp)
+ ld s3,152(sp)
+ ld s4,160(sp)
+ ld s5,168(sp)
+ ld s6,176(sp)
+ ld s7,184(sp)
+ ld s8,192(sp)
+ ld s9,200(sp)
+ ld s10,208(sp)
+ ld s11,216(sp)
+ ld t3,224(sp)
+ ld t4,232(sp)
+ ld t5,240(sp)
+ ld t6,248(sp)
+ addi sp,sp,TF_SIZE
+ csrrw sp,mscratch,sp
+ mret
+.globl mhost_enter_u
+mhost_enter_u:
+ csrw mepc,a0
+ li t0,0x1800
+ csrc mstatus,t0
+ mv sp,a1
+ mv tp,a2
+ mv a0,a3
+ mv a1,a4
+ mret
+.globl mhost_hang
+mhost_hang:
+1:wfi
+ j 1b

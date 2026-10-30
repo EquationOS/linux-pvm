@@ -1,0 +1,69 @@
+#!/bin/sh
+# Minimal verifiable /init for the U-mode guest acceptance.
+# FAILS counts every failed check across the shell suite and the C
+# suite; INIT-ALL-PASS is printed ONLY when FAILS==0, otherwise the
+# run ends with INIT-FAILED and a nonzero marker for the grepper.
+export PATH=/bin
+FAILS=0
+fail() { echo "$1: FAIL"; FAILS=$((FAILS+1)); }
+pass() { echo "$1: PASS"; }
+
+mount -t proc proc /proc 2>/dev/null || fail proc-mount
+mount -t sysfs sysfs /sys 2>/dev/null || fail sys-mount
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || fail dev-mount
+if grep -q 'pvm.test_fail=1' /proc/cmdline; then fail forced-negative-control; fi
+
+echo "=== PVM-RISCV64 U-MODE /INIT ACCEPTANCE BEGIN ==="
+
+echo "--- uname ---"
+if uname -a && [ -n "$(uname -r)" ]; then pass uname; else fail uname; fi
+if uname -m | grep -q riscv64; then pass machine-is-riscv64; else fail machine-is-riscv64; fi
+
+echo "--- echo/cat ---"
+echo "echo-cat: PASS" > /tmp/echo.txt 2>/dev/null || fail echo-cat-write
+if [ "$(cat /tmp/echo.txt 2>/dev/null)" = "echo-cat: PASS" ]; then
+	pass echo-cat-roundtrip
+else
+	fail echo-cat-roundtrip
+fi
+
+echo "--- /proc ---"
+if head -1 /proc/cpuinfo >/dev/null 2>&1; then pass procfs; else fail procfs; fi
+cat /proc/cmdline
+
+echo "--- fork/wait (shell) ---"
+( exit 7 ) & P=$!; wait $P; rc=$?
+[ "$rc" = "7" ] && pass shell-fork-wait || fail "shell-fork-wait($rc)"
+sh -c 'exit 3'; rc=$?
+[ "$rc" = "3" ] && pass subshell-exit-code || fail "subshell-exit-code($rc)"
+
+echo "--- compute ---"
+[ "$((6*7))" = "42" ] && pass arith || fail arith
+
+echo "--- mmap/fork/signal/arith C suite ---"
+if /bin/mmap-test; then
+	pass mmap-suite
+else
+	fail "mmap-suite(rc=$?)"
+	fi
+
+echo "--- U-mode assertion (kernel dmesg) ---"
+if dmesg | grep -q "pvm-guest: PVM host registered (CSR trap mode,"; then
+	pass u-mode-pvm-registered
+else
+	fail u-mode-pvm-registered-no-marker
+fi
+
+echo "=== PVM-RISCV64 U-MODE /INIT ACCEPTANCE END ==="
+if [ "$FAILS" = "0" ]; then
+	echo "INIT-ALL-PASS"
+	sync
+	poweroff -f
+else
+	echo "INIT-FAILED FAILS=$FAILS"
+	sync
+	# still power off (so the machine terminates), but the marker
+	# above is what acceptance greps; poweroff -f only on success
+	# would hang the run on failure.
+	poweroff -f
+fi

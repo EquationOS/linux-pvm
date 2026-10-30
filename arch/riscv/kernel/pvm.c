@@ -11,13 +11,10 @@
  * are dispatched to the handlers here through hypercalls and event
  * delivery.
  *
- * Status: this file provides guest-side scaffolding, i.e. host detection,
- * the hypercall transport and host registration.  The host side (the KVM
- * PVM vendor module for RISC-V) does not exist yet; the PV operations
- * below are prepared but not hooked into the live kernel paths, so a
- * kernel built with CONFIG_PVM_GUEST=y still boots natively (S-mode under
- * OpenSBI or on real hardware): it runs the detection path, optionally
- * attempts registration, and falls back cleanly when no host answers.
+ * Status: an experimental M-mode monitor can bootstrap this kernel in
+ * physical U-mode through CSR trap emulation (pvm,csr-guest). The Linux
+ * KVM PVM vendor module does not exist yet. The synthetic PV frame path
+ * remains scaffolding; ordinary S-mode boots without a marker stay native.
  *
  * Copyright (C) 2020 Ant Group
  * RISC-V port for the USyscall project, 2026.
@@ -38,6 +35,7 @@
 #include <asm/pvm_para.h>
 
 bool pvm_guest_detected __ro_after_init;
+static bool pvm_csr_guest __ro_after_init;
 
 DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 
@@ -58,6 +56,11 @@ static bool __init pvm_detect(void)
 {
 	struct device_node *np;
 
+	np = of_find_compatible_node(NULL, NULL, "pvm,csr-guest");
+	pvm_csr_guest = np != NULL;
+	of_node_put(np);
+	if (pvm_csr_guest)
+		return true;
 	np = of_find_compatible_node(NULL, NULL, "pvm,guest");
 	of_node_put(np);
 
@@ -164,8 +167,8 @@ static void __init pvm_no_host(const char *what, long ret, bool registered)
 	if (registered)
 		pvm_rollback();
 
-	if (pvm_strict)
-		panic("PVM: %s failed (ret %ld) and pvm=strict is set\n",
+	if (pvm_strict || pvm_csr_guest)
+		panic("PVM: %s failed (ret %ld); a PVM host is mandatory\n",
 		      what, ret);
 
 	pr_warn("%s refused (ret %ld), no PVM host: continuing natively\n",
@@ -200,6 +203,13 @@ static int __init pvm_guest_init(void)
 		pvm_no_host("PVM host version handshake", host_version, false);
 		return 0;
 	}
+	if (pvm_csr_guest) {
+		ret = pvm_hypercall0(PVM_HC_GET_FEATURES);
+		if (ret < 0 || !(ret & PVM_FEATURE_CSR_TRAPS)) {
+			pvm_no_host("CSR trap capability", ret, false);
+			return 0;
+		}
+	}
 
 	/* TODO together with the host side: secondary harts register their
 	 * PVCS, TP and event stacks through the CPU bringup path. */
@@ -212,10 +222,16 @@ static int __init pvm_guest_init(void)
 	 * guest user TLS tp.
 	 */
 	kernel_tp = (unsigned long)riscv_current_is_tp;
-	ret = pvm_hypercall3(PVM_HC_REGISTER_PVCS, 0, pvcs_pa, kernel_tp);
+	ret = pvm_hypercall3(PVM_HC_REGISTER_PVCS,
+		pvm_csr_guest ? PVM_REGISTER_CSR_EVENTS : 0, pvcs_pa, kernel_tp);
 	if (ret) {
 		/* REGISTER_PVCS itself failed, the host holds nothing. */
 		pvm_no_host("PVCS registration", ret, false);
+		return 0;
+	}
+	if (pvm_csr_guest) {
+		pr_info("PVM host registered (CSR trap mode, ABI %ld): PVCS at 0x%lx, TP 0x%lx\n",
+			host_version, pvcs_pa, kernel_tp);
 		return 0;
 	}
 
@@ -243,6 +259,10 @@ void __init pvm_early_setup(void)
 	}
 
 	pvm_guest_detected = true;
+	if (pvm_csr_guest) {
+		pr_info("experimental U-mode CSR trap host selected; registration is mandatory\n");
+		return;
+	}
 
 	/*
 	 * Hypercalls are issued later from pvm_guest_init(), once per-CPU

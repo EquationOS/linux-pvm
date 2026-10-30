@@ -50,6 +50,11 @@
 #define PVM_HC_RETU			(PVM_HC_SPECIAL_BASE+8)
 #define PVM_HC_PROBE			(PVM_HC_SPECIAL_BASE+9)
 #define PVM_HC_DEREGISTER		(PVM_HC_SPECIAL_BASE+10)
+#define PVM_HC_GET_FEATURES		(PVM_HC_SPECIAL_BASE+11)
+
+/* Optional trap-and-emulate bootstrap, negotiated before registration. */
+#define PVM_FEATURE_CSR_TRAPS		_BITUL(0)
+#define PVM_REGISTER_CSR_EVENTS		_BITUL(0)
 
 /*
  * PVM_HC_LOAD_PGTBL flags are reserved and must be zero; the host decodes
@@ -82,7 +87,8 @@
  *		OpenSBI this is -2, SBI_ERR_NOT_SUPPORTED)
  *
  * PVM_HC_REGISTER_PVCS binds this vCPU to its communication state:
- *	arg0	flags, reserved, must be zero
+ *	arg0	zero for the PV frame ABI, or PVM_REGISTER_CSR_EVENTS
+ *		when GET_FEATURES advertises PVM_FEATURE_CSR_TRAPS
  *	arg1	GPA of this CPU's struct pvm_vcpu_struct
  *	arg2	the initial guest-kernel tp value for this vCPU (on
  *		RV64 Linux tp holds current).  The host installs it
@@ -97,6 +103,13 @@
  *
  * PVM_HC_DEREGISTER rolls back a partially or fully completed
  * registration of this vCPU (PVCS binding, TP and event entry).
+ *
+ * GET_FEATURES returns an optional capability mask (negative means that
+ * the query is unsupported). CSR_EVENTS uses virtual stvec/sepc/sstatus
+ * and sret, preserving all interrupted GPRs for Linux entry.S to save.
+ * It does not use SET_EVENT_ENTRY, the synthetic frame, or RETU. Native
+ * CSR instructions trap from physical U-mode into the monitor, including
+ * before registration. The DT compatible for this mode is pvm,csr-guest.
  *
  * PVM_HC_RETU asks the host to resume the context described by the frame
  * passed in arg0 (the ERETU analog).  Only valid after a successful
