@@ -33,6 +33,7 @@
 #include <linux/of_fdt.h>
 #include <linux/percpu.h>
 
+#include <asm/current.h>
 #include <asm/ptrace.h>
 #include <asm/pvm_para.h>
 
@@ -103,16 +104,19 @@ void pvm_load_pgtbl(unsigned long satp)
  * injects an event (fault, interrupt or hypercall completion) with the
  * interrupted context saved in a host-provided frame.
  *
- * With no host able to inject events this cannot run; the immediate
- * handlers (interrupt, page fault, syscall from guest user) are future
- * work together with the host side.
+ * There are no functional handlers yet.  Resuming a synchronous event
+ * unchanged would just refault forever, so every event is fatal for
+ * now: log it and tell the entry to stop, which parks this vCPU in a
+ * tight loop instead of corrupting the frame.
+ *
+ * Returns the frame to resume, or NULL when the event is fatal.
  */
 __visible struct pt_regs *pvm_event_dispatch(unsigned long cause,
 					     struct pt_regs *regs)
 {
-	pr_warn_once("PVM event cause 0x%lx at %px has no handler yet\n",
-		     cause, (void *)regs->epc);
-	return regs;
+	pr_crit("PVM event cause 0x%lx at %px has no handler, stopping this vCPU\n",
+		cause, (void *)regs->epc);
+	return NULL;
 }
 
 /* Per-CPU memory may live in the vmalloc area; translate both ways. */
@@ -124,43 +128,106 @@ static unsigned long pvm_ptr_to_phys(void *p)
 }
 
 /*
- * Register this kernel with the PVM host: PVCS first, then the event
- * entry point.  Any failure means "no PVM host answering" (under
- * OpenSBI an unknown-EID ecall returns SBI_ERR_NOT_SUPPORTED instead of
- * crashing), and the kernel continues to run natively.
+ * pvm=strict: registration failure is fatal.  A real U-mode guest
+ * cannot fall back to running natively, so the U-mode boot path will
+ * always register strictly; the permissive fallback below only exists
+ * so an S-mode kernel with a (test) device-tree marker degrades to the
+ * verified native path instead of crashing.  It is a negative test
+ * aid, not a runtime mode of PVM.
+ */
+static bool pvm_strict;
+
+static int __init pvm_cmdline_param(char *arg)
+{
+	if (arg && !strcmp(arg, "strict"))
+		pvm_strict = true;
+	return 0;
+}
+early_param("pvm", pvm_cmdline_param);
+
+/*
+ * Called when registration fails after PVM_HC_REGISTER_PVCS has
+ * succeeded: the host holds our PVCS pointer, so the rollback must be
+ * confirmed before anything else may continue.
+ */
+static void __init pvm_rollback(void)
+{
+	long ret = pvm_hypercall0(PVM_HC_DEREGISTER);
+
+	if (ret)
+		panic("PVM: DEREGISTER failed (ret %ld), host still holds the PVCS pointer\n",
+		      ret);
+}
+
+static void __init pvm_no_host(const char *what, long ret, bool registered)
+{
+	if (registered)
+		pvm_rollback();
+
+	if (pvm_strict)
+		panic("PVM: %s failed (ret %ld) and pvm=strict is set\n",
+		      what, ret);
+
+	pr_warn("%s refused (ret %ld), no PVM host: continuing natively\n",
+		what, ret);
+	pvm_guest_detected = false;
+}
+
+/*
+ * Register this kernel with the PVM host:
+ * PROBE (version handshake) -> REGISTER_PVCS (PVCS + kernel TP) ->
+ * SET_EVENT_ENTRY.  This runs as an early_initcall, which is fine for
+ * the S-mode scaffold but is NOT a U-mode boot entry: a U-mode guest
+ * needs its own loader entry before any head.S/CSR work, see
+ * Documentation/arch/riscv/pvm.rst.
  */
 static int __init pvm_guest_init(void)
 {
-	unsigned long pvcs_pa;
-	long ret;
+	unsigned long pvcs_pa, kernel_tp;
+	long ret, host_version;
 
 	if (!pvm_guest_detected)
 		return 0;
 
+	ret = pvm_hypercall1(PVM_HC_PROBE, PVM_ABI_VERSION);
+	if (ret < 0) {
+		/* Nothing is registered yet, no rollback needed. */
+		pvm_no_host("PVM host probe", ret, false);
+		return 0;
+	}
+	host_version = ret;
+	if (host_version < PVM_ABI_VERSION) {
+		pvm_no_host("PVM host version handshake", host_version, false);
+		return 0;
+	}
+
 	/* TODO together with the host side: secondary harts register their
-	 * PVCS and event stacks through the CPU bringup path. */
+	 * PVCS, TP and event stacks through the CPU bringup path. */
 	pvcs_pa = pvm_ptr_to_phys(this_cpu_ptr(&pvm_vcpu_struct));
-	ret = pvm_hypercall2(PVM_HC_REGISTER_PVCS, 0, pvcs_pa);
+	/*
+	 * Initial kernel-side tp for this vCPU (on RV64 Linux tp holds
+	 * current).  The host installs it when first entering the guest
+	 * kernel context and then saves/restores whatever guest kernel
+	 * value it observes; it must never pass through the interrupted
+	 * guest user TLS tp.
+	 */
+	kernel_tp = (unsigned long)riscv_current_is_tp;
+	ret = pvm_hypercall3(PVM_HC_REGISTER_PVCS, 0, pvcs_pa, kernel_tp);
 	if (ret) {
-		pr_warn("PVCS registration refused (ret %ld), continuing natively\n",
-			ret);
-		goto no_host;
+		/* REGISTER_PVCS itself failed, the host holds nothing. */
+		pvm_no_host("PVCS registration", ret, false);
+		return 0;
 	}
 
 	ret = pvm_hypercall2(PVM_HC_SET_EVENT_ENTRY, 0,
 			     (unsigned long)pvm_event_entry);
 	if (ret) {
-		pr_warn("event entry registration refused (ret %ld), continuing natively\n",
-			ret);
-		goto no_host;
+		pvm_no_host("event entry registration", ret, true);
+		return 0;
 	}
 
-	pr_info("PVM host registered: PVCS at 0x%lx, event entry 0x%lx\n",
-		pvcs_pa, (unsigned long)pvm_event_entry);
-	return 0;
-
-no_host:
-	pvm_guest_detected = false;
+	pr_info("PVM host registered (ABI %ld): PVCS at 0x%lx, TP 0x%lx, event entry 0x%lx\n",
+		host_version, pvcs_pa, kernel_tp, (unsigned long)pvm_event_entry);
 	return 0;
 }
 early_initcall(pvm_guest_init);
@@ -168,6 +235,9 @@ early_initcall(pvm_guest_init);
 void __init pvm_early_setup(void)
 {
 	if (!pvm_detect()) {
+		/* pvm=strict means a PVM host is mandatory: no marker, no boot. */
+		if (pvm_strict)
+			panic("PVM: no device-tree marker and pvm=strict is set\n");
 		pr_info("no PVM host detected, booting natively\n");
 		return;
 	}

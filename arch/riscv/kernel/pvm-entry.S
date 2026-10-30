@@ -3,18 +3,25 @@
  * PVM event entry for RV64.
  *
  * The host enters pvm_event_entry to inject an event into the guest
- * kernel with:
+ * kernel with (see uapi/asm/pvm_para.h for the full contract):
  *
- *	a0	pointer to the host-provided register frame holding the
- *		interrupted context (struct pt_regs layout, read-only
- *		until PVM_HC_RETU hands it back)
+ *	a0	guest virtual address of the host-provided register
+ *		frame holding the interrupted context (struct pt_regs
+ *		layout, read-only until PVM_HC_RETU hands it back)
  *	a1	event cause (raw scause-style value)
- *	sp	a valid, 16-byte aligned guest kernel stack
+ *	sp	a fresh, 16-byte aligned guest kernel stack
+ *	tp/gp	the guest kernel values the host maintains for this
+ *		vCPU; never the interrupted guest user TLS
  *
- * General purpose registers of the interrupted context are already
- * captured in the frame; only the registers live across the C call are
- * saved here.  On return the (possibly updated) frame is handed back to
- * the host through PVM_HC_RETU in a0, the ERETU analog.
+ * All other GPRs are undefined at entry: the interrupted context is
+ * fully captured in the frame.  Callee-saved registers survive the C
+ * call; nothing else needs preserving here.
+ *
+ * Fail-stop contract: pvm_event_dispatch() returns the frame to
+ * resume in a0, or NULL when the event is fatal.  A PVM_HC_RETU that
+ * returns at all is a host protocol violation.  Both cases park this
+ * vCPU in a tight loop -- no further ecalls, no memory access through
+ * a possibly bogus pointer -- instead of resuming or retrying.
  *
  * This code can only run once a PVM host has accepted registration; a
  * native S-mode boot never executes it.
@@ -28,7 +35,6 @@
 	.text
 
 SYM_CODE_START(pvm_event_entry)
-	/* Keep the stack 16-byte aligned across the frame. */
 	addi	sp, sp, -16
 	sd	ra, 0(sp)
 
@@ -36,6 +42,8 @@ SYM_CODE_START(pvm_event_entry)
 	mv	a0, a1		/* cause */
 	mv	a1, a2
 	call	pvm_event_dispatch
+
+	beqz	a0, pvm_event_fail
 
 	ld	ra, 0(sp)
 	addi	sp, sp, 16
@@ -45,6 +53,7 @@ SYM_CODE_START(pvm_event_entry)
 	li	a7, PVM_HC_EID
 	ecall
 
-	/* Should never be reached. */
-	j	pvm_event_entry
+	/* Host protocol violation: fail-stop. */
+SYM_INNER_LABEL(pvm_event_fail, SYM_L_GLOBAL)
+1:	j	1b
 SYM_CODE_END(pvm_event_entry)

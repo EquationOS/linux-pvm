@@ -48,6 +48,8 @@
 #define PVM_HC_REGISTER_PVCS		(PVM_HC_SPECIAL_BASE+6)
 #define PVM_HC_SET_EVENT_ENTRY		(PVM_HC_SPECIAL_BASE+7)
 #define PVM_HC_RETU			(PVM_HC_SPECIAL_BASE+8)
+#define PVM_HC_PROBE			(PVM_HC_SPECIAL_BASE+9)
+#define PVM_HC_DEREGISTER		(PVM_HC_SPECIAL_BASE+10)
 
 /*
  * PVM_HC_LOAD_PGTBL flags are reserved and must be zero; the host decodes
@@ -56,17 +58,70 @@
  */
 
 /*
- * PVM_HC_REGISTER_PVCS registers the per-CPU PVCS with the host:
+ * Guest-side ABI version for the RV64 PVM host protocol.  The guest
+ * probes with the version it was built for; the host answers with the
+ * version it supports (a guest must refuse to run on a lower one).
+ */
+#define PVM_ABI_VERSION			1
+
+/*
+ * Address types used by the registration hypercalls:
+ *
+ *	HPA	host physical, only meaningful inside the host
+ *	GPA	"guest physical": an address in the host-granted backing
+ *		of this guest; the host translates GPA->HPA through its
+ *		 own mapping records, the guest never sees HPAs
+ *	GVA	guest virtual address in the guest kernel address space
+ */
+
+/*
+ * PVM_HC_PROBE performs the version/capability handshake:
+ *	arg0	the PVM_ABI_VERSION the guest was built for
+ *	returns	the highest host-supported PVM_ABI_VERSION, or a
+ *		negative errno when no PVM host is present (under
+ *		OpenSBI this is -2, SBI_ERR_NOT_SUPPORTED)
+ *
+ * PVM_HC_REGISTER_PVCS binds this vCPU to its communication state:
  *	arg0	flags, reserved, must be zero
- *	arg1	physical address of this CPU's struct pvm_vcpu_struct
+ *	arg1	GPA of this CPU's struct pvm_vcpu_struct
+ *	arg2	the initial guest-kernel tp value for this vCPU (on
+ *		RV64 Linux tp holds current).  The host installs it
+ *		when first entering the guest kernel context and then
+ *		saves/restores the guest kernel tp and gp it observes;
+ *		it must never pass through the interrupted guest user
+ *		TLS tp
  *
  * PVM_HC_SET_EVENT_ENTRY installs the event entry point:
  *	arg0	flags, reserved, must be zero
- *	arg1	virtual address of pvm_event_entry
+ *	arg1	GVA of pvm_event_entry
+ *
+ * PVM_HC_DEREGISTER rolls back a partially or fully completed
+ * registration of this vCPU (PVCS binding, TP and event entry).
  *
  * PVM_HC_RETU asks the host to resume the context described by the frame
  * passed in arg0 (the ERETU analog).  Only valid after a successful
- * REGISTER_PVCS; a host must never let it return.
+ * REGISTER_PVCS; a conforming host must never let it return.
+ */
+
+/*
+ * Event injection contract (what pvm_event_entry may rely on):
+ *
+ *	a0	GVA of the register frame (struct pt_regs layout) holding
+ *		the complete interrupted context; read-only for the
+ *		guest until the frame is handed back via PVM_HC_RETU
+ *	a1	event cause, raw scause-style value
+ *	sp	a fresh guest kernel stack top, 16-byte aligned
+ *	tp/gp	the guest kernel values the host maintains for this
+ *		vCPU (initialized from PVM_HC_REGISTER_PVCS arg2 for tp;
+ *		gp matters under shadow call stacks); never the
+ *		interrupted guest user TLS tp
+ *
+ * All other GPRs are undefined at entry; the interrupted context is
+ * fully captured in the frame.  FPU/vector state belongs to the
+ * interrupted context: the host preserves it with the frame, and
+ * event entry and dispatch code must not touch it.  Events are
+ * delivered with virtual interrupts inhibited (event_flags.SIE = 0)
+ * and the host keeps them inhibited until the matching PVM_HC_RETU.
  */
 
 /*
