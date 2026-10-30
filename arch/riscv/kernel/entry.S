@@ -241,6 +241,27 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	move a0, sp
 	call riscv_v_context_nesting_end
 #endif
+#ifdef CONFIG_PVM_GUEST
+	/* E1: PV slow-path return to user ONLY.  Label 1 is shared by
+	 * both user and supervisor returns (the SPP branch above jumps
+	 * here for SUP->SUP), so we MUST explicitly re-test PT_STATUS
+	 * SPP: skip PV_RETURN entirely when SPP=1 (kernel-to-kernel
+	 * return goes through the native restore below). */
+	REG_L	t0, PT_STATUS(sp)
+	andi	t0, t0, SR_SPP
+	bnez	t0, 2f		/* SPP=1: supervisor return, native path */
+	la	t0, pvm_pv_mode_active
+	lb	t0, 0(t0)
+	beqz	t0, 2f		/* PV not active */
+	mv	a0, sp
+	call	pvm_pv_return
+	/* PV_RETURN returned: the host rejected our kernel-internal
+	 * frame.  Park via a C helper (printk is not callable here). */
+	call	pvm_pv_return_rejected
+3:	wfi
+	j	3b
+2:
+#endif
 	REG_L a0, PT_STATUS(sp)
 	/*
 	 * The current load reservation is effectively part of the processor's

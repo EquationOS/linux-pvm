@@ -53,10 +53,34 @@
 #define PVM_HC_GET_FEATURES		(PVM_HC_SPECIAL_BASE+11)
 #define PVM_HC_STATS_RESET		(PVM_HC_SPECIAL_BASE+12)
 #define PVM_HC_STATS_READ		(PVM_HC_SPECIAL_BASE+13)
+#define PVM_HC_PV_RETURN		(PVM_HC_SPECIAL_BASE+14)
+#define PVM_HC_PV_SET_ENTRY		(PVM_HC_SPECIAL_BASE+15)
+#define PVM_HC_PV_IRQ_SAVE		(PVM_HC_SPECIAL_BASE+16)
+#define PVM_HC_PV_IRQ_RESTORE		(PVM_HC_SPECIAL_BASE+17)
+#define PVM_HC_PV_IRQ_DISABLE		(PVM_HC_SPECIAL_BASE+18)
 
 /* Optional trap-and-emulate bootstrap, negotiated before registration. */
 #define PVM_FEATURE_CSR_TRAPS		_BITUL(0)
 #define PVM_REGISTER_CSR_EVENTS		_BITUL(0)
+
+/* E1: full PV slow-path mode (guest PV entry + PV_RETURN + irq/mm hooks).
+ * Negotiated like CSR_TRAPS; PV uses the same CSR event delivery for
+ * async faults/IRQs but adds explicit PV entry/return for syscalls. */
+#define PVM_FEATURE_PV_EVENTS		_BITUL(1)
+#define PVM_REGISTER_PV_EVENTS		_BITUL(1)
+
+/*
+ * PVM_HC_PV_RETURN (E1, slow path): the guest kernel, having finished
+ * handling a user-mode event in the PV entry, passes the pt_regs
+ * pointer in a0 and asks the host to restore that user context via
+ * sret semantics (virtual SIE/SPP restored; physical mode stays U).
+ * The host C slow path validates the full 288-byte frame page by page
+ * (kernel-virtual U=0, writable, within the memslot), refreshes its
+ * private cache on every task/frame/TP change, and only then performs
+ * the virtual return.  A user-mode forgery of this hypercall is just a
+ * user ecall: it is delivered to the guest kernel as a syscall and
+ * never elevates identity.
+ */
 
 /*
  * PVM_HC_LOAD_PGTBL flags are reserved and must be zero; the host decodes

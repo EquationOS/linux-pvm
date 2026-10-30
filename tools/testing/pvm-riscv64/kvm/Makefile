@@ -11,7 +11,7 @@ PAYLOAD_LDS := -Ttext=0x80200000
 W := $(PVM_WORKDIR)
 .SECONDARY:
 
-all: vmm vmm-linux vmm-neg payload.bin payload-c.bin payload-loop.bin payload-d.bin payload-mmu.bin getpid-window fp-signal-test
+all: vmm vmm-linux vmm-neg payload.bin payload-c.bin payload-loop.bin payload-d.bin payload-mmu.bin payload-pvforge.bin getpid-window fp-signal-test
 
 vmm: vmm.c
 	$(CROSS)gcc $(CFLAGS) -o $@ $<
@@ -35,6 +35,10 @@ fp-signal-test: fp-signal-test.c
 
 %.bin: %.elf
 	$(CROSS)objcopy -O binary -j .text $< $@
+
+payload-pvforge.elf: payload-pvforge.S
+	$(CROSS)gcc $(ASFLAGS) -c -o $*.o $<
+	$(CROSS)gcc $(LDFLAGS_PAYLOAD) $(PAYLOAD_LDS) -o $@ $*.o
 
 guest-initramfs-d:
 	bash build-guest-initramfs-d.sh

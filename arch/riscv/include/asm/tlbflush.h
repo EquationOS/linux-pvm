@@ -15,13 +15,31 @@
 #define FLUSH_TLB_NO_ASID       ((unsigned long)-1)
 
 #ifdef CONFIG_MMU
+#ifdef CONFIG_PVM_GUEST
+#include <asm/pvm_hypercall.h>
+#define PVM_TLB_HOOKED PVM_HOOKS_ACTIVE
+#endif
+
 static inline void local_flush_tlb_all(void)
 {
+#ifdef CONFIG_PVM_GUEST
+	if (PVM_TLB_HOOKED) {
+		pvm_pv_tlb_flush_all();
+		return;
+	}
+#endif
 	__asm__ __volatile__ ("sfence.vma" : : : "memory");
 }
 
 static inline void local_flush_tlb_all_asid(unsigned long asid)
 {
+#ifdef CONFIG_PVM_GUEST
+	if (PVM_TLB_HOOKED) {
+		/* Host conservatively flushes everything */
+		pvm_pv_tlb_flush_all();
+		return;
+	}
+#endif
 	if (asid != FLUSH_TLB_NO_ASID)
 		ALT_SFENCE_VMA_ASID(asid);
 	else
@@ -31,12 +49,24 @@ static inline void local_flush_tlb_all_asid(unsigned long asid)
 /* Flush one page from local TLB */
 static inline void local_flush_tlb_page(unsigned long addr)
 {
+#ifdef CONFIG_PVM_GUEST
+	if (PVM_TLB_HOOKED) {
+		pvm_pv_tlb_flush_page(addr);
+		return;
+	}
+#endif
 	ALT_SFENCE_VMA_ADDR(addr);
 }
 
 static inline void local_flush_tlb_page_asid(unsigned long addr,
 					     unsigned long asid)
 {
+#ifdef CONFIG_PVM_GUEST
+	if (PVM_TLB_HOOKED) {
+		pvm_pv_tlb_flush_page(addr);
+		return;
+	}
+#endif
 	if (asid != FLUSH_TLB_NO_ASID)
 		ALT_SFENCE_VMA_ADDR_ASID(addr, asid);
 	else

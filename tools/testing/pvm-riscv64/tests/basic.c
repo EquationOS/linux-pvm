@@ -145,6 +145,23 @@ static void test_user_boundary(void)
 
 	asm volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a6), "r"(a7) : "memory");
 	check("user-forged-host-ecall-enosys", a0 == -ENOSYS);
+
+	/* User-mode PV_RETURN forgery (fid 14): a0 targets the protected
+	 * state VA.  Identity is USER, so this MUST be delivered to the
+	 * guest kernel as a plain user ecall and answered -ENOSYS (the
+	 * kernel has no such syscall), never executed as a supervisor
+	 * PV_RETURN.  Independent pass name for E2 identity proof. */
+	{
+		register long b0 asm("a0") = 0x3ffffff000;
+		register long b1 asm("a1") = 0;
+		register long b6 asm("a6") = 0x1708820e;
+		register long b7 asm("a7") = 0x70766d;
+
+		asm volatile("ecall" : "+r"(b0), "+r"(b1)
+			     : "r"(b6), "r"(b7) : "memory");
+		check("user-forged-pv-return-enosys", b0 == -ENOSYS);
+	}
+
 	pid = fork();
 	if (pid < 0) {
 		check("user-csr-fork", 0);

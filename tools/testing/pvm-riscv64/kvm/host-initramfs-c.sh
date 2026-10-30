@@ -24,6 +24,7 @@ cp "$K/payload-c.bin" "$C/rootfs/payload-c.bin"
 cp "$K/payload-loop.bin" "$C/rootfs/payload-loop.bin"
 cp "$K/payload-d.bin" "$C/rootfs/payload-d.bin"
 cp "$K/payload-mmu.bin" "$C/rootfs/payload-mmu.bin"
+cp "$K/payload-pvforge.bin" "$C/rootfs/payload-pvforge.bin"
 cp "$W/guest/arch/riscv/boot/Image" "$C/rootfs/guest-Image"
 cp "$W/stage-b/guest.dtb" "$C/rootfs/guest.dtb"
 cp "$GUEST_INITRD" "$C/rootfs/guest-initramfs.cpio.gz"
@@ -42,6 +43,10 @@ echo "=== STAGE-C NEGATIVE SUITE ==="
 /pvm-neg
 NEGRC=$?
 echo "STAGE-C NEG_RC=$NEGRC"
+echo "=== STAGE-E1 PV FORGE TEST ==="
+/pvm-neg pvforge
+PFRC=$?
+echo "STAGE-E1 FORGE_RC=$PFRC"
 echo "=== STAGE-D MMU PAYLOAD ==="
 /pvm-neg mmu
 MMURC=$?

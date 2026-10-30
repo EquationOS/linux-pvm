@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _ASM_RISCV_PVM_PARA_H
 #define _ASM_RISCV_PVM_PARA_H
+#include <asm/pvm_hypercall.h>
 
 #include <linux/init.h>
 #include <uapi/asm/pvm_para.h>
@@ -96,6 +97,8 @@ static inline void pvm_early_setup(void)
 }
 
 #endif /* CONFIG_PVM_GUEST */
+
+
 
 #endif /* !__ASSEMBLY__ */
 

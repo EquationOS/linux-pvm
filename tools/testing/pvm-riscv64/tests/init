@@ -48,7 +48,7 @@ else
 	fi
 
 echo "--- U-mode assertion (kernel dmesg) ---"
-if dmesg | grep -q "pvm-guest: PVM host registered (CSR trap mode,"; then
+if dmesg | grep -Fq -e "pvm-guest: PVM host registered (CSR trap mode," -e "pvm-guest: PVM host registered (PV slow-path mode,"; then
 	pass u-mode-pvm-registered
 else
 	fail u-mode-pvm-registered-no-marker

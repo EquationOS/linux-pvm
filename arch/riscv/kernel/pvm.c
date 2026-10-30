@@ -34,10 +34,35 @@
 
 #include <asm/current.h>
 #include <asm/ptrace.h>
+#include <linux/irqflags.h>
+#include <linux/thread_info.h>
+
+#include <asm/entry-common.h>
 #include <asm/pvm_para.h>
 
 bool pvm_guest_detected __ro_after_init;
 static bool pvm_csr_guest __ro_after_init;
+
+static bool pvm_pv_guest __ro_after_init;
+static bool __initdata pvm_pv_mode_requested;
+
+/*
+ * E1: pv_mode=csr (default) keeps the CSR-trap bootstrap; pv_mode=pv
+ * requests the full PV slow path (PV entry + PV_RETURN + irq/mm
+ * hooks).  Both require a matching host; a negotiation failure is a
+ * hard failure (strict), never a silent fallback to CSR claiming PV.
+ */
+static int __init pvm_pv_mode_cmdline(char *arg)
+{
+	if (!arg)
+		return -EINVAL;
+	if (!strcmp(arg, "pv"))
+		pvm_pv_mode_requested = true;
+	else if (strcmp(arg, "csr"))
+		return -EINVAL;
+	return 0;
+}
+early_param("pvm_mode", pvm_pv_mode_cmdline);
 
 DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 
@@ -61,8 +86,12 @@ static bool __init pvm_detect(void)
 	np = of_find_compatible_node(NULL, NULL, "pvm,csr-guest");
 	pvm_csr_guest = np != NULL;
 	of_node_put(np);
-	if (pvm_csr_guest)
+	if (pvm_csr_guest) {
+		/* pv_mode=pv upgrades a csr-guest DT marker to full PV */
+		if (pvm_pv_mode_requested)
+			pvm_pv_guest = true;
 		return true;
+	}
 	np = of_find_compatible_node(NULL, NULL, "pvm,guest");
 	of_node_put(np);
 
@@ -235,6 +264,7 @@ static ssize_t pvm_stats_read(struct file *f, char __user *ub,
 		"\"satp\":%llu,\"fill\":%llu,\"inj_fault\":%llu,"
 		"\"inj_irq\":%llu,\"host_irq\":%llu,\"vmm_exit\":%llu,"
 		"\"wfi\":%llu,\"exits\":%llu,\"inj_ill\":%llu,"
+		"\"pv_entry\":%llu,\"pv_return\":%llu,\"pv_reject\":%llu,"
 		"\"derived_root_writes\":%llu,\"derived_label\":\"4x_exits\"}\n",
 		pvm_stats_page[14], pvm_stats_page[0], pvm_stats_page[1],
 		pvm_stats_page[2], pvm_stats_page[3], pvm_stats_page[4],
@@ -242,10 +272,8 @@ static ssize_t pvm_stats_read(struct file *f, char __user *ub,
 		pvm_stats_page[8], pvm_stats_page[9], pvm_stats_page[10],
 		pvm_stats_page[11], pvm_stats_page[12], pvm_stats_page[13],
 		pvm_stats_page[15],
-		4ULL * pvm_stats_page[13]); /* derived: the fixed asm gate
-			* path performs 4 satp writes per C-level exit; this
-			* is an inference from exits, NOT a counted event.
-			* Stage E's fast gate will count real asm events. */
+		pvm_stats_page[16], pvm_stats_page[17], pvm_stats_page[18],
+		4ULL * pvm_stats_page[13]);
 	return simple_read_from_buffer(ub, n, off, buf, len);
 }
 
@@ -253,6 +281,129 @@ static const struct proc_ops pvm_stats_ops = {
 	.proc_write = pvm_stats_write,
 	.proc_read = pvm_stats_read,
 };
+
+/*
+ * E1 guest PV entry: the host (C slow path) enters here in guest kernel
+ * context with kernel TP/GP/SP installed and a0 = pt_regs of the
+ * user-mode event.  We jump into the normal kernel exception flow.
+ * Async faults/IRQs keep the CSR event path (sepc/scause in the pt_regs
+ * constructed by the host).
+ */
+bool pvm_pv_mode_active __ro_after_init;
+EXPORT_SYMBOL_GPL(pvm_pv_mode_active);
+
+asmlinkage void do_trap_ecall_u(struct pt_regs *regs);
+
+/* Called from entry.S when PV_RETURN is rejected for a kernel-internal
+ * frame.  This is a host-side bug; park with a message. */
+asmlinkage void __noreturn pvm_pv_return_rejected(void)
+{
+	pr_emerg("pvm-guest: PV_RETURN rejected for kernel frame (host bug), parking\n");
+	while (1)
+		cpu_relax();
+}
+asmlinkage void pvm_pv_return(struct pt_regs *regs);
+
+asmlinkage void __noreturn pvm_pv_entry(struct pt_regs *regs)
+{
+	/* The host enters here with kernel TP/GP/SP installed and
+	 * a0 = pt_regs of a user-mode ecall (virtual identity USER at
+	 * the time of the trap).  The frame lives at the registered
+	 * kernel stack slot; virtual sscratch contract: PV kernel sees
+	 * sscratch=0 (host owns it), USER would see saved kernel TP --
+	 * matching native entry.S's TP/stack convention because the
+	 * host installs kernel TP before entering. */
+	do_trap_ecall_u(regs);
+	/* After the syscall, perform the PV return: pass the (possibly
+	 * updated) frame to the host.  The host validates and does the
+	 * virtual sret.  If the host rejects (shouldn't for our own
+	 * frame), we must NOT return to an undefined ra -- park. */
+	pvm_pv_return(regs);
+	/* host rejected: this is a host-side bug for a kernel-internal
+	 * frame; park here rather than returning to garbage */
+	pr_err("pvm-guest: PV_RETURN rejected for kernel frame\n");
+	while (1)
+		cpu_relax();
+}
+
+/*
+ * PV_RETURN wrapper: called from ret_from_exception's PV branch with
+ * the pt_regs pointer.  a0 = frame; returns only if the host rejected
+ * it (should not happen for kernel-internal calls).
+ */
+asmlinkage void pvm_pv_return(struct pt_regs *regs)
+{
+	unsigned long __flags;
+
+	/*
+	 * Reset the task's saved kernel SP to just above this frame --
+	 * mirroring what native ret_from_exception does (addi s0,sp,PT_SIZE;
+	 * REG_S s0,TASK_TI_KERNEL_SP(tp)).  Without this, nested kernel
+	 * traps during the syscall leave a mid-stack value in TI_KERNEL_SP;
+	 * the next user entry (or copy_thread's canonical frame) then
+	 * derives from a stale pointer and the frame address drifts down
+	 * the stack on every kernel-nested syscall.  thread_info is at
+	 * offset 0 of task_struct; tp holds current in the kernel.
+	 */
+	__flags = arch_local_irq_save();
+	current_thread_info()->kernel_sp = (unsigned long)(regs + 1);
+
+	/*
+	 * Clear any dangling load reservation before returning to user
+	 * context, mirroring the sc.d on PT_EPC that the native
+	 * ret_from_exception performs.  The frame's epc is untouched
+	 * (the dummy SC writes it back with the same value).
+	 */
+	__asm__ __volatile__ (
+		"lr.d zero, (%0)\n"
+		"sc.d zero, %1, (%0)"
+		: : "r" (&regs->epc), "r" (regs->epc) : "memory");
+
+	pvm_hypercall1(PVM_HC_PV_RETURN, (unsigned long)regs);
+	(void)__flags;
+	/* If the host returns here at all, it rejected the frame; the
+	 * caller (pvm_pv_entry) parks.  Direct callers from entry.S
+	 * also park via pvm_pv_return_rejected. */
+}
+
+/* E1: PV IRQ helper semantics assertion.  Runs only when PV mode is
+ * active.  Verifies: enable -> read=enabled -> save returns old=enabled
+ * and disables -> read=disabled -> restore -> read=enabled.  This
+ * catches the "PV_IRQ_DISABLE clears before reading old" bug class. */
+static int __init pvm_irq_state_test(void)
+{
+	unsigned long f1, f2;
+
+	if (!pvm_pv_mode_active)
+		return 0;
+	/* post-boot regression: same cycle through the LOCAL helpers
+	 * (which now go through the PV hypercalls when mode is on) */
+	local_irq_enable();
+	f1 = arch_local_save_flags();
+	if (!(f1 & SR_IE)) {
+		pr_err("PVM-IRQTEST: FAIL enable->read not set (0x%lx)\n", f1);
+		return -1;
+	}
+	f1 = arch_local_irq_save();
+	if (!(f1 & SR_IE)) {
+		pr_err("PVM-IRQTEST: FAIL save lost old-enabled (0x%lx)\n", f1);
+		return -1;
+	}
+	f2 = arch_local_save_flags();
+	if (f2 & SR_IE) {
+		pr_err("PVM-IRQTEST: FAIL still enabled after save (0x%lx)\n", f2);
+		return -1;
+	}
+	arch_local_irq_restore(f1);
+	f2 = arch_local_save_flags();
+	if (!(f2 & SR_IE)) {
+		pr_err("PVM-IRQTEST: FAIL not re-enabled after restore (0x%lx)\n", f2);
+		return -1;
+	}
+	pr_info("PVM-IRQTEST: PASS (enable/save/read/restore cycle correct)\n");
+	return 0;
+}
+late_initcall(pvm_irq_state_test);
 
 static int pvm_stats_init(void)
 {
@@ -293,6 +444,16 @@ static int __init pvm_guest_init(void)
 			pvm_no_host("CSR trap capability", ret, false);
 			return 0;
 		}
+		if (pvm_pv_guest) {
+			/* Full PV requested: the host must ALSO offer
+			 * PV_EVENTS.  Failure is explicit (strict), no
+			 * silent CSR fallback claiming PV. */
+			if (!(ret & PVM_FEATURE_PV_EVENTS)) {
+				pr_err("pvm-guest: pv_mode=pv but host lacks PV_EVENTS (features=0x%lx)\n", ret);
+				panic("PVM: PV mode requested but not negotiated\n");
+			}
+			pr_info("pvm-guest: PV_EVENTS negotiated (features=0x%lx)\n", ret);
+		}
 	}
 
 	/* TODO together with the host side: secondary harts register their
@@ -307,14 +468,71 @@ static int __init pvm_guest_init(void)
 	 */
 	kernel_tp = (unsigned long)riscv_current_is_tp;
 	ret = pvm_hypercall3(PVM_HC_REGISTER_PVCS,
-		pvm_csr_guest ? PVM_REGISTER_CSR_EVENTS : 0, pvcs_pa, kernel_tp);
+		pvm_csr_guest ?
+		  (pvm_pv_guest ? PVM_REGISTER_PV_EVENTS :
+				  PVM_REGISTER_CSR_EVENTS) : 0,
+		pvcs_pa, kernel_tp);
 	if (ret) {
 		/* REGISTER_PVCS itself failed, the host holds nothing. */
 		pvm_no_host("PVCS registration", ret, false);
 		return 0;
 	}
 	if (pvm_csr_guest) {
-		pr_info("PVM host registered (CSR trap mode, ABI %ld): PVCS at 0x%lx, TP 0x%lx\n",
+		if (pvm_pv_guest) {
+			long r;
+			/* IRQ helper self-test BEFORE enabling the global
+			 * hook: directly call the hypercalls to verify
+			 * save returns the old state, disable clears,
+			 * restore re-enables.  Only after PASS do we set
+			 * pvm_pv_mode_active=true. */
+			{
+				unsigned long f0, f1, f2;
+
+				/* save the ORIGINAL SIE so we leave it intact */
+				pvm_pv_irq_save(&f0);
+
+				pvm_pv_irq_restore(SR_IE); /* enable */
+				pvm_pv_irq_save(&f1);
+				if (!(f1 & SR_IE)) {
+					pr_err("pvm-guest: IRQ self-test FAIL save(old)\n");
+					panic("PVM: IRQ self-test failed with pvm_mode=pv\n");
+				}
+				pvm_pv_irq_disable(&f1); /* atomic save+disable */
+				if (!(f1 & SR_IE)) {
+					pr_err("pvm-guest: IRQ self-test FAIL disable(old)\n");
+					panic("PVM: IRQ self-test failed with pvm_mode=pv\n");
+				}
+				pvm_pv_irq_save(&f2);
+				if (f2 & SR_IE) {
+					pr_err("pvm-guest: IRQ self-test FAIL still-on\n");
+					panic("PVM: IRQ self-test failed with pvm_mode=pv\n");
+				}
+				pvm_pv_irq_restore(f1); /* restore to enabled */
+				pvm_pv_irq_save(&f2);
+				if (!(f2 & SR_IE)) {
+					pr_err("pvm-guest: IRQ self-test FAIL restore\n");
+					panic("PVM: IRQ self-test failed with pvm_mode=pv\n");
+				}
+				/* restore the ORIGINAL state */
+				pvm_pv_irq_restore(f0);
+				pr_info("pvm-guest: IRQ helper self-test PASS\n");
+			}
+			/* register the PV entry (a0=entry only) */
+			r = pvm_hypercall3(PVM_HC_PV_SET_ENTRY,
+					   (unsigned long)pvm_pv_entry, 0, 0);
+			if (r == 0) {
+				pvm_pv_mode_active = true;
+				pr_info("pvm-guest: PV entry registered (entry=0x%lx)\n",
+					(unsigned long)pvm_pv_entry);
+			} else {
+				/* Requested PV mode with an explicit
+				 * negotiation failure: panic, no silent
+				 * CSR fallback claiming PV. */
+				panic("PVM: PV entry rejected (%ld) with pvm_mode=pv\n", r);
+			}
+		}
+		pr_info("PVM host registered (%s mode, ABI %ld): PVCS at 0x%lx, TP 0x%lx\n",
+			pvm_pv_mode_active ? "PV slow-path" : "CSR trap",
 			host_version, pvcs_pa, kernel_tp);
 		return 0;
 	}

@@ -189,6 +189,13 @@ static void set_mm_asid(struct mm_struct *mm, unsigned int cpu)
 	raw_spin_unlock_irqrestore(&context_lock, flags);
 
 switch_mm_fast:
+#ifdef CONFIG_PVM_GUEST
+	if (pvm_pv_mode_active)
+		pvm_pv_load_pgtbl(virt_to_pfn(mm->pgd) |
+				  (cntx2asid(cntx) << SATP_ASID_SHIFT) |
+				  satp_mode);
+	else
+#endif
 	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) |
 		  (cntx2asid(cntx) << SATP_ASID_SHIFT) |
 		  satp_mode);
@@ -200,8 +207,16 @@ switch_mm_fast:
 static void set_mm_noasid(struct mm_struct *mm)
 {
 	/* Switch the page table and blindly nuke entire local TLB */
-	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
-	local_flush_tlb_all_asid(0);
+#ifdef CONFIG_PVM_GUEST
+	if (pvm_pv_mode_active) {
+		pvm_pv_load_pgtbl(virt_to_pfn(mm->pgd) | satp_mode);
+		pvm_pv_tlb_flush_all();
+	} else
+#endif
+	{
+		csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
+		local_flush_tlb_all_asid(0);
+	}
 }
 
 static inline void set_mm(struct mm_struct *prev,

@@ -29,6 +29,7 @@
 #define PVM_STAGE_C_MAGIC 0x50564D4B564D4D43UL
 #define PVM_STAGE_D_MAGIC 0x50564D4B564D4B44UL
 #define PVM_STAGE_D2_MAGIC 0x50564D4B564D4D55UL
+#define E1_FORGE_MAGIC 0x50564D45314F4BUL
 
 static void die(const char *what)
 {
@@ -188,6 +189,12 @@ static int run_payload(const char *path)
 
 int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "pvforge")) {
+		int rc = run_payload_magic("/payload-pvforge.bin", E1_FORGE_MAGIC);
+		printf("STAGE-E1-FORGE: %s\n", rc == 0 ? "PASS" : "FAIL");
+		return rc;
+	}
+
 	if (argc > 1 && !strcmp(argv[1], "mmu")) {
 		int rc = run_payload_magic("/payload-mmu.bin", PVM_STAGE_D2_MAGIC);
 		printf("STAGE-MMU: %s\n", rc == 0 ? "PASS" : "FAIL");

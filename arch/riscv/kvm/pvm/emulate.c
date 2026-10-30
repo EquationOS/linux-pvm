@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "pvm.h"
+#include <asm/ptrace.h>
+#include <asm/pgtable-bits.h>
+#include <linux/moduleparam.h>
+static bool pv_debug;
+module_param(pv_debug, bool, 0644);
 #define R(i) v->s->g[i]
 void pvm_inject(struct riscv_pvm_vcpu *v, unsigned long cause,
 		unsigned long val)
@@ -120,6 +125,162 @@ static int writecsr(struct riscv_pvm_vcpu *v, unsigned long c,
 		pvm_reset_roots(v);
 	return 0;
 }
+/* A frame always belongs to guest RAM; no guest address is dereferenced
+ * as a host pointer. Validate each segment before copying either way. */
+struct pv_frame_map {
+	void *kva[2];
+	size_t len[2];
+};
+static int pv_map_frame(struct riscv_pvm_vcpu *v, unsigned long va,
+			struct pv_frame_map *m)
+{
+	size_t left = sizeof(struct pt_regs), done = 0;
+	int i;
+
+	BUILD_BUG_ON(sizeof(struct pt_regs) != 288);
+	BUILD_BUG_ON(offsetof(struct pt_regs, ra) != sizeof(unsigned long));
+	BUILD_BUG_ON(offsetof(struct pt_regs, status) != 32 * sizeof(unsigned long));
+	memset(m, 0, sizeof(*m));
+	if ((va & 15) || va > ULONG_MAX - left)
+		return -EINVAL;
+	for (i = 0; left && i < 2; i++) {
+		unsigned long pte, gpa = pvm_translate(v, va + done, &pte);
+		size_t len = min_t(size_t, left,
+				    PAGE_SIZE - offset_in_page(va + done));
+
+		if (!gpa || (pte & _PAGE_USER) ||
+		    (pte & (_PAGE_READ | _PAGE_WRITE)) !=
+			(_PAGE_READ | _PAGE_WRITE))
+			return -EFAULT;
+		m->kva[i] = pvm_gpa(v, gpa, len);
+		if (!m->kva[i])
+			return -EFAULT;
+		m->len[i] = len;
+		done += len;
+		left -= len;
+	}
+	return left ? -EFAULT : 0;
+}
+static void pv_copy_frame(struct pv_frame_map *m, struct pt_regs *fr,
+			  bool to_guest)
+{
+	size_t off = 0;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (to_guest)
+			memcpy(m->kva[i], (char *)fr + off, m->len[i]);
+		else
+			memcpy((char *)fr + off, m->kva[i], m->len[i]);
+		off += m->len[i];
+		if (off == sizeof(*fr))
+			break;
+	}
+}
+static void pv_set_status(struct riscv_pvm_vcpu *v, unsigned long st)
+{
+	unsigned long mask = SR_SIE | SR_SPIE | SR_SPP | SR_SUM | PVM_MXR | SR_FS;
+	unsigned long old = v->csr[0];
+
+	v->csr[0] = st & mask;
+	if ((old ^ st) & (SR_SUM | PVM_MXR))
+		pvm_reset_roots(v);
+}
+static int pv_return_user(struct riscv_pvm_vcpu *v, unsigned long fva)
+{
+	struct pv_frame_map m;
+	struct pt_regs fr;
+	unsigned long st;
+	int ret;
+
+	if (!v->registered || !v->pv_mode || !v->pv_entry_gva)
+		return -EPERM;
+	ret = pv_map_frame(v, fva, &m);
+	if (ret)
+		return ret;
+	pv_copy_frame(&m, &fr, false);
+	if (fr.status & SR_SPP)
+		return -EINVAL;
+	if (pv_debug && (v->pv_flow_diag++ < 128 || !fr.epc))
+		pr_info("PVM_PV_RETURN frame=%lx ktp=%lx pc=%lx ra=%lx sp=%lx a7=%lx st=%lx\n",
+			fva, R(4), fr.epc, fr.ra, fr.sp, fr.a7, fr.status);
+
+	/* Capture kernel registers BEFORE replacing them with user state.
+	 * The frame is the current task's real kernel-stack pt_regs. */
+	v->kernel_tp = R(4);
+	v->kernel_gp = R(3);
+	v->pv_frame_gva = fva;
+	v->pv_frame_sp = fva;
+	v->pv_frame_kva[0] = m.kva[0];
+	v->pv_frame_kva[1] = m.kva[1];
+	v->pv_frame_len[0] = m.len[0];
+	v->pv_frame_len[1] = m.len[1];
+	v->pv_context_valid = true;
+	st = (fr.status & ~(SR_SIE | SR_SPP)) | SR_SPIE;
+	if (fr.status & SR_SPIE)
+		st |= SR_SIE;
+	pv_set_status(v, st);
+	v->csr[CSR_SSCRATCH - 0x100] = v->kernel_tp;
+	v->csr[CSR_SEPC - 0x100] = fr.epc & ~1UL;
+	memcpy(&v->s->g[1], &fr.ra, 31 * sizeof(unsigned long));
+	R(32) = fr.epc & ~1UL;
+	v->supervisor = false;
+	v->user_entries++;
+	v->n_pv_return++;
+	return 0;
+}
+static bool pv_enter_syscall(struct riscv_pvm_vcpu *v)
+{
+	struct pv_frame_map m;
+	struct pt_regs fr;
+	unsigned long st, pte, gpa;
+
+	if (!v->registered || !v->pv_mode || !v->pv_entry_gva ||
+	    !v->pv_context_valid)
+		return false;
+	/* Re-walk in the C path, including after guest address-space changes.
+	 * E2 may cache this translation, with explicit invalidation rules. */
+	gpa = pvm_translate(v, v->pv_entry_gva, &pte);
+	if (!gpa || (pte & _PAGE_USER) || !(pte & _PAGE_EXEC) ||
+	    !pvm_gpa(v, gpa, 2) || pv_map_frame(v, v->pv_frame_gva, &m))
+		return false;
+
+	memset(&fr, 0, sizeof(fr));
+	fr.epc = R(32);
+	memcpy(&fr.ra, &v->s->g[1], 31 * sizeof(unsigned long));
+	readcsr(v, CSR_SSTATUS, &st);
+	fr.status = (st & ~(SR_SPP | SR_SIE | SR_SPIE)) |
+		    ((st & SR_SIE) ? SR_SPIE : 0);
+	fr.cause = 8;
+	fr.orig_a0 = R(10);
+	if (pv_debug && (v->pv_flow_diag++ < 128 || !fr.epc))
+		pr_info("PVM_PV_ENTER frame=%lx ktp=%lx pc=%lx ra=%lx sp=%lx a7=%lx st=%lx\n",
+			v->pv_frame_gva, v->kernel_tp, fr.epc, fr.ra, fr.sp, fr.a7, fr.status);
+	pv_copy_frame(&m, &fr, true);
+
+	v->csr[CSR_SEPC - 0x100] = fr.epc;
+	v->csr[CSR_SCAUSE - 0x100] = 8;
+	v->csr[CSR_STVAL - 0x100] = 0;
+	v->csr[CSR_SSCRATCH - 0x100] = 0;
+	/* Match the native entry's disabling of SUM and FP before kernel C. */
+	pv_set_status(v, fr.status & ~(SR_SUM | SR_FS));
+	R(2) = v->pv_frame_sp;
+	R(3) = v->kernel_gp;
+	R(4) = v->kernel_tp;
+	R(10) = v->pv_frame_gva;
+	R(32) = v->pv_entry_gva;
+	v->supervisor = true;
+	v->n_pv_entry++;
+	return true;
+}
+
+static void pv_irq_trace(struct riscv_pvm_vcpu *v)
+{
+	if (pv_debug && v->pv_diag++ < 16)
+		pr_info("PVM_PV_IRQ pc=%lx ra=%lx fid=%lx virtual_s=%d sie=%lx\n",
+			R(32), R(1), R(16), v->supervisor, v->csr[0] & SR_SIE);
+}
+
 static int hypercall(struct riscv_pvm_vcpu *v)
 {
 	long ret = -ENOSYS;
@@ -129,12 +290,12 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 		ret = R(10) == PVM_ABI_VERSION ? PVM_ABI_VERSION : -EINVAL;
 		break;
 	case PVM_HC_GET_FEATURES:
-		ret = PVM_FEATURE_CSR_TRAPS;
+		ret = PVM_FEATURE_CSR_TRAPS | PVM_FEATURE_PV_EVENTS;
 		break;
 	case PVM_HC_REGISTER_PVCS:
 		if (v->registered)
 			ret = -EBUSY;
-		else if (R(10) != PVM_REGISTER_CSR_EVENTS || (R(11) & 4095) ||
+		else if ((R(10) != PVM_REGISTER_CSR_EVENTS && R(10) != PVM_REGISTER_PV_EVENTS) || (R(11) & 4095) ||
 			 !pvm_gpa(v, R(11), 4096) || R(12) != R(4) ||
 			 !pvm_translate(v, R(12), &pte) || (pte & 0x10))
 			ret = -EINVAL;
@@ -142,11 +303,14 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 			v->pvcs = R(11);
 			v->kernel_tp = R(12);
 			v->registered = true;
+			v->pv_mode = R(10) == PVM_REGISTER_PV_EVENTS;
 			ret = 0;
 		}
 		break;
 	case PVM_HC_DEREGISTER:
 		v->registered = false;
+		v->pv_mode = v->pv_context_valid = false;
+		v->pv_entry_gva = 0;
 		v->pvcs = v->kernel_tp = 0;
 		ret = 0;
 		break;
@@ -169,6 +333,42 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 	case PVM_HC_IRQ_HALT:
 		ret = v->registered ? 0 : -EPERM;
 		v->halted = v->registered && R(16) == PVM_HC_IRQ_HALT;
+		break;
+	case PVM_HC_PV_SET_ENTRY: {
+		unsigned long entry = R(10), gpa, flags;
+
+		if (!v->registered || !v->pv_mode) { ret = -EPERM; break; }
+		if ((entry & 1) || R(11) || R(12)) { ret = -EINVAL; break; }
+		gpa = pvm_translate(v, entry, &flags);
+		if (!gpa || (flags & _PAGE_USER) || !(flags & _PAGE_EXEC) ||
+		    !pvm_gpa(v, gpa, 2)) { ret = -EFAULT; break; }
+		v->pv_entry_gva = entry;
+		v->pv_context_valid = false;
+		ret = 0;
+		break;
+	}
+	case PVM_HC_PV_RETURN:
+		ret = pv_return_user(v, R(10));
+		if (!ret)
+			return 1; /* user GPRs/PC are restored; do not use generic tail */
+		v->n_pv_reject++;
+		break;
+	case PVM_HC_PV_IRQ_SAVE:
+		pv_irq_trace(v);
+		if (!v->registered || !v->pv_mode) { ret = -EPERM; break; }
+		ret = v->csr[0] & SR_SIE; /* read-only */
+		break;
+	case PVM_HC_PV_IRQ_DISABLE:
+		pv_irq_trace(v);
+		if (!v->registered || !v->pv_mode) { ret = -EPERM; break; }
+		ret = v->csr[0] & SR_SIE; /* old value before atomic clear */
+		v->csr[0] &= ~SR_SIE;
+		break;
+	case PVM_HC_PV_IRQ_RESTORE:
+		pv_irq_trace(v);
+		if (!v->registered || !v->pv_mode) { ret = -EPERM; break; }
+		v->csr[0] = (v->csr[0] & ~SR_SIE) | (R(10) & SR_SIE);
+		ret = 0;
 		break;
 	case PVM_HC_STATS_RESET: {
 		/* Start a measurement window: record the current counter
@@ -194,6 +394,9 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 		v->w_wfi = v->n_wfi;
 		v->w_inj_ill = v->n_inj_ill;
 		v->w_exits = v->exits;
+		v->w_pv_entry = v->n_pv_entry;
+		v->w_pv_return = v->n_pv_return;
+		v->w_pv_reject = v->n_pv_reject;
 		v->win_active = 1;
 		ret = 0;
 		break;
@@ -236,6 +439,9 @@ static int hypercall(struct riscv_pvm_vcpu *v)
 		dst[13] = v->exits - v->w_exits;
 		dst[14] = 2; /* schema version */
 		dst[15] = v->n_inj_ill - v->w_inj_ill;
+		dst[16] = v->n_pv_entry - v->w_pv_entry;
+		dst[17] = v->n_pv_return - v->w_pv_return;
+		dst[18] = v->n_pv_reject - v->w_pv_reject;
 		v->win_active = 0;
 		ret = 0;
 		break;
@@ -320,6 +526,9 @@ int pvm_emulate(struct riscv_pvm_vcpu *v)
 	int ret;
 	if (c >> 63) {
 		v->n_host_irq++;
+		if (pv_debug && v->pv_mode && v->pv_irq_diag++ < 4)
+			pr_info("PVM_PV_HOSTIRQ pc=%lx virtual_s=%d sie=%lx\n",
+				R(32), v->supervisor, v->csr[0] & SR_SIE);
 		return 1; /* Physical host IRQ: normal Linux handles it after exit. */
 	}
 	if (c == 12 || c == 13 || c == 15) {
@@ -339,7 +548,10 @@ int pvm_emulate(struct riscv_pvm_vcpu *v)
 	if (c == 8) {
 		if (v->supervisor)
 			return sbi(v);
-		pvm_inject(v, 8, 0);
+		if (pv_enter_syscall(v))
+			v->n_user_ecall++;
+		else
+			pvm_inject(v, 8, 0);
 		return 1;
 	}
 	if (c != 2) {
