@@ -11,11 +11,10 @@
  * are dispatched to the handlers here through hypercalls and event
  * delivery.
  *
- * Status: a Linux S-mode KVM PVM host supports a bounded CSR reference
- * and explicit PV syscall entry/return, with optional software S-gate
- * acceleration. Both guest kernel and user programs run physically in
- * U-mode without H. Ordinary boots without a PVM marker remain native.
- * The older synthetic event/RETU protocol is still unsupported.
+ * Status: an experimental M-mode monitor can bootstrap this kernel in
+ * physical U-mode through CSR trap emulation (pvm,csr-guest). The Linux
+ * KVM PVM vendor module does not exist yet. The synthetic PV frame path
+ * remains scaffolding; ordinary S-mode boots without a marker stay native.
  *
  * Copyright (C) 2020 Ant Group
  * RISC-V port for the USyscall project, 2026.
@@ -100,9 +99,10 @@ static bool __init pvm_detect(void)
 }
 
 /*
- * Legacy out-of-line PV wrappers. Live IRQ/MMU hooks use the minimal
- * pvm_hypercall.h helpers after PV negotiation; native boots never call
- * these wrappers. Fault and interrupt delivery still uses CSR emulation.
+ * Dormant PV operations for the future host side, mirroring the pv_ops of
+ * the x86_64 implementation.  They are intentionally not wired into the
+ * live kernel paths yet: with no host to answer the ecalls, any of them
+ * would trap into SBI/OpenSBI.
  */
 void noinstr pvm_safe_halt(void)
 {
@@ -207,10 +207,13 @@ static void __init pvm_no_host(const char *what, long ret, bool registered)
 	pvm_guest_detected = false;
 }
 
-/* Registration follows CSR-emulated bootstrap of the physical U-mode
- * kernel. The selected mode negotiates its feature bit and PVCS first;
- * explicit PV syscalls additionally register pvm_pv_entry. The legacy
- * synthetic event protocol remains separate and unsupported by this host.
+/*
+ * Register this kernel with the PVM host:
+ * PROBE (version handshake) -> REGISTER_PVCS (PVCS + kernel TP) ->
+ * SET_EVENT_ENTRY.  This runs as an early_initcall, which is fine for
+ * the S-mode scaffold but is NOT a U-mode boot entry: a U-mode guest
+ * needs its own loader entry before any head.S/CSR work, see
+ * Documentation/arch/riscv/pvm.rst.
  */
 /* ---- D2: measurement window via /proc/pvm_stats ---- */
 static u64 *pvm_stats_page;
@@ -239,7 +242,7 @@ static ssize_t pvm_stats_write(struct file *f, const char __user *ub,
 			pvm_ptr_to_phys(pvm_stats_page));
 		if (r) return -EIO;
 		pvm_stats_on = false;
-		pvm_stats_valid = (pvm_stats_page[14] == 3);
+		pvm_stats_valid = (pvm_stats_page[14] == 2);
 		return n;
 	}
 	return -EINVAL;
@@ -248,8 +251,8 @@ static ssize_t pvm_stats_write(struct file *f, const char __user *ub,
 static ssize_t pvm_stats_read(struct file *f, char __user *ub,
 			      size_t n, loff_t *off)
 {
-	/* Dump the last snapshot as one JSON line (schema v3). */
-	char buf[1024];
+	/* Dump the last snapshot as one JSON line (schema v2). */
+	char buf[640];
 	int len;
 
 	if (!pvm_stats_page || !pvm_stats_valid)
@@ -262,8 +265,7 @@ static ssize_t pvm_stats_read(struct file *f, char __user *ub,
 		"\"inj_irq\":%llu,\"host_irq\":%llu,\"vmm_exit\":%llu,"
 		"\"wfi\":%llu,\"exits\":%llu,\"inj_ill\":%llu,"
 		"\"pv_entry\":%llu,\"pv_return\":%llu,\"pv_reject\":%llu,"
-		"\"phys_traps\":%llu,\"root_writes\":%llu,\"sfences\":%llu,"
-		"\"fast_in\":%llu,\"fast_out\":%llu,\"fast_irq\":%llu,\"fast_fallback\":%llu}\n",
+		"\"derived_root_writes\":%llu,\"derived_label\":\"4x_exits\"}\n",
 		pvm_stats_page[14], pvm_stats_page[0], pvm_stats_page[1],
 		pvm_stats_page[2], pvm_stats_page[3], pvm_stats_page[4],
 		pvm_stats_page[5], pvm_stats_page[6], pvm_stats_page[7],
@@ -271,9 +273,7 @@ static ssize_t pvm_stats_read(struct file *f, char __user *ub,
 		pvm_stats_page[11], pvm_stats_page[12], pvm_stats_page[13],
 		pvm_stats_page[15],
 		pvm_stats_page[16], pvm_stats_page[17], pvm_stats_page[18],
-		pvm_stats_page[19], pvm_stats_page[20], pvm_stats_page[21],
-		pvm_stats_page[22], pvm_stats_page[23], pvm_stats_page[24],
-		pvm_stats_page[25]);
+		4ULL * pvm_stats_page[13]);
 	return simple_read_from_buffer(ub, n, off, buf, len);
 }
 

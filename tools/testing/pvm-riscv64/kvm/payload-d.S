@@ -117,7 +117,7 @@ probe_loop:
 	li t2, 6
 	bne t1, t2, fail
 	ld t1, 112(t0)
-	li t2, 3
+	li t2, 2
 	bne t1, t2, fail
 	li a1, MAGIC
 	j shutdown

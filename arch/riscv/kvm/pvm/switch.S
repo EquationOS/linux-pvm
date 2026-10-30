@@ -6,20 +6,6 @@
 .option norelax
 .option arch, +d
 .text
-
-/* Only t1 is clobbered; every call site has saved guest GPRs. */
-.macro PVM_COUNT off
- ld t1,\off(a0)
- addi t1,t1,1
- sd t1,\off(a0)
-.endm
-.macro PVM_ROOT off
- ld t0,\off(a0)
- csrw satp,t0
- PVM_COUNT PVM_F_ROOT_WRITES
- sfence.vma
- PVM_COUNT PVM_F_SFENCES
-.endm
 SYM_FUNC_START(riscv_pvm_switch)
  sd ra,PVM_HREG+8(a0)
  sd sp,PVM_HREG+16(a0)
@@ -139,18 +125,14 @@ SYM_FUNC_START(riscv_pvm_switch)
  ld t0,PVM_GFP+256(a0)
  fscsr t0
  csrw satp,a1
- PVM_COUNT PVM_F_ROOT_WRITES
  sfence.vma
- PVM_COUNT PVM_F_SFENCES
  li t0,PVM_GATE_VA
  jr t0
 .Lhost_return:
  ld a0,PVM_HOST_KVA(a0)
  ld t0,PVM_HSATP(a0)
  csrw satp,t0
- PVM_COUNT PVM_F_ROOT_WRITES
  sfence.vma
- PVM_COUNT PVM_F_SFENCES
  ld t0,PVM_HSTVEC(a0)
  csrw stvec,t0
  ld t0,PVM_HSCRATCH(a0)
@@ -192,11 +174,7 @@ pvm_gate_start:
  csrw sscratch,a0
  ld t0,PVM_GSATP(a0)
  csrw satp,t0
- PVM_COUNT PVM_F_ROOT_WRITES
  sfence.vma
- PVM_COUNT PVM_F_SFENCES
-.Lgate_restore:
- csrw sscratch,a0
  ld t0,256(a0)
  csrw sepc,t0
  ld t0,264(a0)
@@ -276,204 +254,6 @@ pvm_gate_start:
  sd t0,272(a0)
  csrr t0,stval
  sd t0,280(a0)
- /* Every physical trap is counted, including the C path. */
- PVM_COUNT PVM_F_PHYS_TRAPS
- ld t0,264(a0)
- andi t0,t0,SR_SPP
- bnez t0,.Lgate_slow
- ld t0,PVM_F_ENABLED(a0)
- beqz t0,.Lgate_slow
- ld t0,272(a0)
- li t1,8
- bne t0,t1,.Lgate_slow /* all real host IRQs leave the gate */
- ld t0,PVM_F_VIRT_SUP(a0)
- beqz t0,.Lpv_syscall
- ld t0,136(a0)
- li t1,0x70766d
- bne t0,t1,.Lgate_slow
- ld t0,128(a0)
- li t1,0x1708820e
- beq t0,t1,.Lpv_return
- li t1,0x17088210
- beq t0,t1,.Lpv_irq_read
- li t1,0x17088211
- beq t0,t1,.Lpv_irq_restore
- li t1,0x17088212
- beq t0,t1,.Lpv_irq_disable
- j .Lgate_slow
-
-.Lpv_syscall:
- ld t0,PVM_F_CACHE_VALID(a0)
- beqz t0,.Lpv_fallback
- ld t0,PVM_F_VIRT_STATUS(a0)
- li t1,(SR_SUM|0x80000)
- and t1,t0,t1
- bnez t1,.Lpv_fallback
- /* Host KVA is meaningful only after entering the bridge root. */
- PVM_ROOT PVM_BRIDGE
- ld t2,PVM_F_FRAME_KVA(a0)
- ld t3,256(a0)
- sd t3,0(t2)
- addi t4,a0,8
- addi t5,t2,8
- li t6,31
-.Lpv_copy_in:
- ld t3,0(t4)
- sd t3,0(t5)
- addi t4,t4,8
- addi t5,t5,8
- addi t6,t6,-1
- bnez t6,.Lpv_copy_in
- /* Build the USER post-trap status before disabling kernel FP.
-  * Fast admission excludes SUM/MXR; UXL is fixed to RV64. */
- li t3,0x200000000
- ld t4,PVM_F_VIRT_STATUS(a0)
- andi t4,t4,SR_SIE
- beqz t4,.Lpv_no_spie
- ori t3,t3,SR_SPIE
-.Lpv_no_spie:
- ld t4,264(a0)
- li t5,SR_FS
- and t4,t4,t5
- or t3,t3,t4
- li t5,SR_FS_DIRTY
- bne t4,t5,.Lpv_no_sd
- li t5,SR_SD
- or t3,t3,t5
-.Lpv_no_sd:
- sd t3,256(t2)
- sd zero,264(t2)
- li t4,8
- sd t4,272(t2)
- ld t4,80(a0)
- sd t4,280(t2)
- andi t3,t3,SR_SPIE
- sd t3,PVM_F_VIRT_STATUS(a0) /* kernel FS/SUM Off, SIE=0 */
- li t3,1
- sd t3,PVM_F_VIRT_SUP(a0)
- ld t3,256(a0)
- sd t3,PVM_F_VIRT_SEPC(a0)
- li t3,8
- sd t3,PVM_F_VIRT_SCAUSE(a0)
- sd zero,PVM_F_VIRT_STVAL(a0)
- sd zero,PVM_F_VIRT_SSCRATCH(a0)
- /* C entry starts BELOW the frame, just as in the E1 C path. */
- ld t3,PVM_F_FRAME_GVA(a0)
- sd t3,16(a0)
- sd t3,80(a0)
- ld t3,PVM_F_KERNEL_GP(a0)
- sd t3,24(a0)
- ld t3,PVM_F_KERNEL_TP(a0)
- sd t3,32(a0)
- ld t3,PVM_F_ENTRY_GVA(a0)
- sd t3,256(a0)
- li t3,0x200000020 /* real UXL64, SPIE=1, FS/SIE/SPP=0 */
- sd t3,264(a0)
- PVM_COUNT PVM_F_FAST_IN
- PVM_ROOT PVM_F_KERNEL_ROOT
- j .Lgate_restore
-
-.Lpv_return:
- ld t0,PVM_F_CACHE_VALID(a0)
- beqz t0,.Lpv_fallback
- ld t0,80(a0)
- ld t1,PVM_F_FRAME_GVA(a0)
- bne t0,t1,.Lpv_fallback
- ld t0,32(a0)
- ld t1,PVM_F_KERNEL_TP(a0)
- bne t0,t1,.Lpv_fallback
- ld t0,PVM_F_VIRT_STATUS(a0)
- li t1,(SR_SUM|0x80000)
- and t0,t0,t1
- bnez t0,.Lpv_fallback
- PVM_ROOT PVM_BRIDGE
- ld t2,PVM_F_FRAME_KVA(a0)
- ld t3,256(t2)
- li t4,(SR_SPP|SR_SUM|0x80000)
- and t4,t3,t4
- bnez t4,.Lpv_fallback
- /* Copy all GPRs while the host KVA is mapped.  The common restore
-  * uses only the private state page under the final user root. */
- addi t4,t2,8
- addi t5,a0,8
- li t6,31
-.Lpv_copy_out:
- ld t0,0(t4)
- sd t0,0(t5)
- addi t4,t4,8
- addi t5,t5,8
- addi t6,t6,-1
- bnez t6,.Lpv_copy_out
- ld t0,0(t2)
- andi t0,t0,-2
- sd t0,256(a0)
- sd t0,PVM_F_VIRT_SEPC(a0)
- /* Virtual sret: SIE=frame.SPIE, SPIE=1, SPP=0; only the
-  * supported FS bits survive this conservative fast admission. */
- li t4,SR_FS
- and t4,t3,t4
- ori t5,t4,SR_SPIE
- andi t6,t3,SR_SPIE
- beqz t6,.Lpv_return_irq_masked
- ori t5,t5,SR_SIE
-.Lpv_return_irq_masked:
- sd t5,PVM_F_VIRT_STATUS(a0)
- sd zero,PVM_F_VIRT_SUP(a0)
- ld t5,PVM_F_KERNEL_TP(a0)
- sd t5,PVM_F_VIRT_SSCRATCH(a0)
- li t5,0x200000020
- or t4,t4,t5
- sd t4,264(a0) /* real FS from frame, always host IRQ-enabled U */
- PVM_COUNT PVM_F_FAST_OUT
- PVM_ROOT PVM_F_USER_ROOT
- j .Lgate_restore
-
-.Lpv_irq_read:
- ld t0,PVM_F_VIRT_STATUS(a0)
- andi t1,t0,SR_SIE
- sd t1,80(a0)
- j .Lpv_irq_done
-.Lpv_irq_disable:
- ld t0,PVM_F_VIRT_STATUS(a0)
- andi t1,t0,SR_SIE
- sd t1,80(a0)
- andi t0,t0,-3
- sd t0,PVM_F_VIRT_STATUS(a0)
- j .Lpv_irq_done
-.Lpv_irq_restore:
- ld t0,80(a0)
- andi t0,t0,SR_SIE
- beqz t0,.Lpv_irq_restore_off
- ld t1,PVM_F_PENDING_IRQ(a0)
- bnez t1,.Lpv_fallback
- ld t1,PVM_F_VIRT_STATUS(a0)
- ori t1,t1,SR_SIE
- j .Lpv_irq_restore_store
-.Lpv_irq_restore_off:
- ld t1,PVM_F_VIRT_STATUS(a0)
- andi t1,t1,-3
-.Lpv_irq_restore_store:
- sd t1,PVM_F_VIRT_STATUS(a0)
- sd zero,80(a0)
-.Lpv_irq_done:
- sd zero,88(a0) /* hypercall second return value */
- ld t0,256(a0)
- addi t0,t0,4
- sd t0,256(a0)
- ld t0,264(a0)
- li t1,(SR_FS|0x80000)
- and t0,t0,t1
- li t1,0x200000020
- or t0,t0,t1
- sd t0,264(a0)
- PVM_COUNT PVM_F_FAST_IRQ
- j .Lgate_restore
-
-.Lpv_fallback:
- /* A candidate misses the C-validated cache or needs full checking.
-  * This is a subset of C exits, never an extra physical trap. */
- PVM_COUNT PVM_F_FALLBACK
-.Lgate_slow:
  li t0,0x6000
  csrs sstatus,t0
  fsd f0,PVM_GFP+0(a0)
@@ -546,9 +326,7 @@ pvm_gate_start:
  fscsr t0
  ld t0,PVM_BRIDGE(a0)
  csrw satp,t0
- PVM_COUNT PVM_F_ROOT_WRITES
  sfence.vma
- PVM_COUNT PVM_F_SFENCES
  /* restore host scounteren/senvcfg before re-enabling IRQ/preempt */
  ld t2,PVM_HSCNTEN(a0)
  csrw scounteren,t2
